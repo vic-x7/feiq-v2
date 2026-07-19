@@ -1,0 +1,29 @@
+[package]
+name = "feiq-2026"
+version = "0.0.1"
+edition = "2024"
+default-run = "feiq-cli"
+
+[lib]
+name = "feiq_v2"
+path = "src/lib.rs"
+
+[[bin]]
+name = "feiq-cli"
+path = "src/bin/cli/main.rs"
+
+[[bin]]
+name = "feiq-gui"
+path = "src/bin/gui/main.rs"
+
+[dependencies]
+thiserror = "2.0.19"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.0", features = ["full"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+encoding_rs = "0.8.35"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.2", features = ["derive"] }
+md5 = "0.8.1"
+eframe = "0.35.0"
+async-trait = "0.1.91"

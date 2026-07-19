@@ -1,0 +1,27 @@
+# Rust build artifacts
+target/
+
+*.local
+
+# Editor directories and files
+.vscode/*
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Local SQLite databases (if run in dev mode locally or via tests)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# AI Agent configuration & skills
+.agents/
+.gemini/
+AGENTS.md
+skills-lock.json
