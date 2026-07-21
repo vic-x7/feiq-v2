@@ -3,7 +3,6 @@ use std::sync::Arc;
 use tokio::sync::broadcast::Sender as BroadcastSender;
 use tokio::sync::mpsc::Sender as MpscSender;
 
-use super::actor::BroadcastEventDispatcher;
 use crate::database::DbClient;
 use crate::network::NetworkEngineTrait;
 use crate::types::{CoreCommand, CoreEvent, CancellationToken};
@@ -32,7 +31,6 @@ pub struct HandlerContext {
     pub db: DbClient,
     pub event_tx: BroadcastSender<CoreEvent>,
     pub cmd_tx: MpscSender<CoreCommand>,
-    pub dispatcher: Arc<BroadcastEventDispatcher>,
     pub cancel: CancellationToken,
 }
 

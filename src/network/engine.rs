@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use super::{NetworkEvents, AckTracker, FileRegistry, PeerDirectory, SharedFile};
+use super::{AckTracker, FileRegistry, PeerDirectory, SharedFile};
 use crate::protocol::*;
 use crate::network::transport::NetworkTransport;
 use crate::error::AppError;
@@ -30,7 +30,7 @@ pub struct NetworkEngine {
     pub stats_errors: std::sync::atomic::AtomicU64,
 
     packet_dispatcher: Arc<super::PacketDispatcher>,
-    pub(crate) event_dispatcher: Arc<dyn NetworkEvents>,
+    pub(crate) event_tx: tokio::sync::broadcast::Sender<crate::types::CoreEvent>,
 
     // Deep modules extracted for Candidate 1 refactor
     pub ack_tracker: AckTracker,
@@ -47,7 +47,7 @@ impl NetworkEngine {
         username: String,
         hostname: String,
         transport: Arc<dyn NetworkTransport>,
-        event_dispatcher: Arc<dyn NetworkEvents>,
+        event_tx: tokio::sync::broadcast::Sender<crate::types::CoreEvent>,
         max_task_id: i64,
     ) -> Result<Self, AppError> {
         let final_port = transport
@@ -81,7 +81,7 @@ impl NetworkEngine {
             stats_bytes_received: std::sync::atomic::AtomicU64::new(0),
             stats_errors: std::sync::atomic::AtomicU64::new(0),
             packet_dispatcher,
-            event_dispatcher,
+            event_tx,
             ack_tracker: AckTracker::new(),
             file_registry: FileRegistry::new(),
             peer_directory: PeerDirectory::new(),
@@ -92,6 +92,19 @@ impl NetworkEngine {
     /// Increments and returns the next transfer task ID (C10)
     pub fn next_transfer_task_id(&self) -> i64 {
         self.next_task_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn make_progress_callback(&self) -> Arc<dyn Fn(i64, f64, crate::types::TransferStatus) + Send + Sync + 'static> {
+        let event_tx = self.event_tx.clone();
+        Arc::new(
+            move |task_id: i64, progress: f64, status: crate::types::TransferStatus| {
+                let _ = event_tx.send(crate::types::CoreEvent::TransferProgress {
+                    task_id,
+                    progress,
+                    status,
+                });
+            },
+        )
     }
 
     /// Register a custom peer port manually in our peer ports list (useful for loopback or testing).
@@ -282,14 +295,7 @@ impl NetworkEngine {
             engine_clone.handle_tcp_upload_request(peer_ip, request_payload)
         });
 
-        let engine_clone2 = self.clone();
-        let progress_callback = Arc::new(
-            move |task_id: i64, progress: f64, status: crate::types::TransferStatus| {
-                engine_clone2
-                    .event_dispatcher
-                    .on_transfer_progress(task_id, progress, status);
-            },
-        );
+        let progress_callback = self.make_progress_callback();
 
         let cancel_tcp = cancel.clone();
         tokio::spawn(async move {
@@ -401,13 +407,13 @@ impl NetworkEngine {
         })?;
 
         let task_id = self.next_transfer_task_id();
-        self.event_dispatcher.on_transfer_started(
+        let _ = self.event_tx.send(crate::types::CoreEvent::TransferStarted {
             task_id,
-            peer_ip.to_string(),
-            file_info.name.clone(),
-            file_info.size as i64,
-            true, // is_sending
-        );
+            peer_ip: peer_ip.to_string(),
+            file_name: file_info.name.clone(),
+            file_size: file_info.size as i64,
+            is_sending: true,
+        });
 
         Ok(crate::network::transport::UploadRequestDetails {
             file_path: file_info.path,
@@ -499,12 +505,7 @@ impl NetworkEngine {
         let file_size = req.file_size;
         let task_id = req.task_id;
 
-        let dispatcher = self.event_dispatcher.clone();
-        let progress_callback = Arc::new(
-            move |task_id: i64, progress: f64, status: crate::types::TransferStatus| {
-                dispatcher.on_transfer_progress(task_id, progress, status);
-            },
-        );
+        let progress_callback = self.make_progress_callback();
 
         match self
             .transport

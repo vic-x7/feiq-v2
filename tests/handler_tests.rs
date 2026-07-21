@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use feiq_v2::database::DatabaseManager;
-use feiq_v2::engine::actor::BroadcastEventDispatcher;
 use feiq_v2::engine::handlers::{
     CommandHandler, HandlerContext, SendMessageHandler, UpdateIdentityHandler, SendKnockHandler,
 };
@@ -114,7 +113,6 @@ async fn test_send_message_handler() {
     let db_client = feiq_v2::database::DbClient::new(db);
 
     let (event_tx, _event_rx) = broadcast_channel(128);
-    let dispatcher = Arc::new(BroadcastEventDispatcher::new(event_tx.clone()));
 
     // Inject our beautiful mock network engine instead of binding actual system ports!
     let mock_network = Arc::new(MockNetworkEngine::new());
@@ -131,7 +129,6 @@ async fn test_send_message_handler() {
         db: db_client.clone(),
         event_tx: event_tx.clone(),
         cmd_tx: cmd_tx.clone(),
-        dispatcher: dispatcher.clone(),
         cancel: CancellationToken::new(),
     };
 
@@ -178,7 +175,6 @@ async fn test_update_identity_handler() {
     let db_client = feiq_v2::database::DbClient::new(db);
 
     let (event_tx, _event_rx) = broadcast_channel(128);
-    let dispatcher = Arc::new(BroadcastEventDispatcher::new(event_tx.clone()));
 
     let mock_network = Arc::new(MockNetworkEngine::new());
     let (cmd_tx, _cmd_rx) = mpsc_channel(64);
@@ -188,7 +184,6 @@ async fn test_update_identity_handler() {
         db: db_client.clone(),
         event_tx: event_tx.clone(),
         cmd_tx: cmd_tx.clone(),
-        dispatcher: dispatcher.clone(),
         cancel: CancellationToken::new(),
     };
 
@@ -226,7 +221,6 @@ async fn test_send_knock_handler() {
     let db_client = feiq_v2::database::DbClient::new(db);
 
     let (event_tx, _event_rx) = broadcast_channel(128);
-    let dispatcher = Arc::new(BroadcastEventDispatcher::new(event_tx.clone()));
 
     let mock_network = Arc::new(MockNetworkEngine::new());
     mock_network
@@ -242,7 +236,6 @@ async fn test_send_knock_handler() {
         db: db_client.clone(),
         event_tx: event_tx.clone(),
         cmd_tx: cmd_tx.clone(),
-        dispatcher: dispatcher.clone(),
         cancel: CancellationToken::new(),
     };
 

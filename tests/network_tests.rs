@@ -1,64 +1,12 @@
 use feiq_v2::database::DatabaseManager;
-use feiq_v2::network::{NetworkEngine, NetworkEvents};
+use feiq_v2::network::NetworkEngine;
 use feiq_v2::types::{FileDownloadRequest, CancellationToken};
 use std::sync::Arc;
 
-struct MockEvents;
-
-impl NetworkEvents for MockEvents {
-    fn on_peer_status_changed(
-        &self,
-        _ip: String,
-        _username: String,
-        _hostname: String,
-        _nickname: Option<String>,
-        _online: bool,
-    ) {
-    }
-
-    fn on_message_received(
-        &self,
-        _sender_ip: String,
-        _text_content: String,
-        _timestamp: i64,
-        _username: String,
-    ) {
-    }
-
-    fn on_file_attachments_received(
-        &self,
-        _sender_ip: String,
-        _packet_no: u32,
-        _files: Vec<feiq_v2::protocol::FileAttachment>,
-    ) {
-    }
-
-    fn on_window_knock(&self, _sender_ip: String, _username: String) {}
-
-    fn on_peer_typing(&self, _sender_ip: String, _typing: bool) {}
-
-    fn on_transfer_progress(
-        &self,
-        _task_id: i64,
-        _progress: f64,
-        _status: feiq_v2::types::TransferStatus,
-    ) {
-    }
-
-    fn on_transfer_started(
-        &self,
-        _task_id: i64,
-        _peer_ip: String,
-        _file_name: String,
-        _file_size: i64,
-        _is_sending: bool,
-    ) {
-    }
-}
 #[tokio::test]
 async fn test_network_engine_binding_and_fallback() {
-    let dispatcher1 = Arc::new(MockEvents);
-    let dispatcher2 = Arc::new(MockEvents);
+    let (event_tx1, _) = tokio::sync::broadcast::channel(128);
+    let (event_tx2, _) = tokio::sync::broadcast::channel(128);
 
     // 1. Create first network engine on loopback
     let transport1 = Arc::new(
@@ -70,7 +18,7 @@ async fn test_network_engine_binding_and_fallback() {
         "alice".to_string(),
         "alice-pc".to_string(),
         transport1,
-        dispatcher1,
+        event_tx1,
         0,
     );
 
@@ -92,7 +40,7 @@ async fn test_network_engine_binding_and_fallback() {
         "bob".to_string(),
         "bob-pc".to_string(),
         transport2,
-        dispatcher2,
+        event_tx2,
         0,
     );
 
@@ -132,8 +80,8 @@ async fn test_network_file_transfer_loopback() {
         file.write_all(test_content.as_bytes()).unwrap();
     }
 
-    let dispatcher_bob = Arc::new(MockEvents);
-    let dispatcher_alice = Arc::new(MockEvents);
+    let (event_tx_bob, _) = tokio::sync::broadcast::channel(128);
+    let (event_tx_alice, _) = tokio::sync::broadcast::channel(128);
 
     // Initialize databases
     let _db_bob = Arc::new(std::sync::Mutex::new(
@@ -154,7 +102,7 @@ async fn test_network_file_transfer_loopback() {
             "bob".to_string(),
             "bob-pc".to_string(),
             transport_bob,
-            dispatcher_bob,
+            event_tx_bob,
             0,
         )
         .unwrap(),
@@ -170,7 +118,7 @@ async fn test_network_file_transfer_loopback() {
             "alice".to_string(),
             "alice-pc".to_string(),
             transport_alice,
-            dispatcher_alice,
+            event_tx_alice,
             0,
         )
         .unwrap(),
@@ -314,74 +262,18 @@ async fn test_tokio_transport_udp_sending_and_parsing() {
 
 #[tokio::test]
 async fn test_fake_transport_injection_and_behavior() {
-    use feiq_v2::network::{FakeTransport, NetworkEngine, NetworkEvents};
-    use std::sync::Mutex;
-
-    struct DummyEvents {
-        status_updates: Mutex<Vec<(String, String, bool)>>,
-    }
-
-    impl NetworkEvents for DummyEvents {
-        fn on_peer_status_changed(
-            &self,
-            ip: String,
-            username: String,
-            _hostname: String,
-            _nickname: Option<String>,
-            online: bool,
-        ) {
-            self.status_updates
-                .lock()
-                .unwrap()
-                .push((ip, username, online));
-        }
-        fn on_message_received(
-            &self,
-            _sender_ip: String,
-            _text_content: String,
-            _timestamp: i64,
-            _username: String,
-        ) {
-        }
-        fn on_file_attachments_received(
-            &self,
-            _sender_ip: String,
-            _packet_no: u32,
-            _files: Vec<feiq_v2::protocol::FileAttachment>,
-        ) {
-        }
-        fn on_window_knock(&self, _sender_ip: String, _username: String) {}
-        fn on_peer_typing(&self, _sender_ip: String, _typing: bool) {}
-        fn on_transfer_progress(
-            &self,
-            _task_id: i64,
-            _progress: f64,
-            _status: feiq_v2::types::TransferStatus,
-        ) {
-        }
-        fn on_transfer_started(
-            &self,
-            _task_id: i64,
-            _peer_ip: String,
-            _file_name: String,
-            _file_size: i64,
-            _is_sending: bool,
-        ) {
-        }
-    }
+    use feiq_v2::network::{FakeTransport, NetworkEngine};
 
     let local_addr = "127.0.0.1:12345".parse().unwrap();
     let transport = Arc::new(FakeTransport::new(local_addr));
-    let dispatcher = Arc::new(DummyEvents {
-        status_updates: Mutex::new(Vec::new()),
-    });
+    let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(128);
 
     let engine = Arc::new(
         NetworkEngine::new(
             "alice".to_string(),
             "alice-pc".to_string(),
             transport.clone(),
-            dispatcher.clone(),
+            event_tx,
             0,
         )
         .unwrap(),
@@ -416,11 +308,14 @@ async fn test_fake_transport_injection_and_behavior() {
         .unwrap();
 
     // Verify dispatcher received status changed update
-    let updates = dispatcher.status_updates.lock().unwrap();
-    assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].0, "192.168.1.200");
-    assert_eq!(updates[0].1, "bob");
-    assert!(updates[0].2);
+    let event = event_rx.try_recv().unwrap();
+    if let feiq_v2::types::CoreEvent::PeerStatusChanged { ip, username, online, .. } = event {
+        assert_eq!(ip, "192.168.1.200");
+        assert_eq!(username, "bob");
+        assert!(online);
+    } else {
+        panic!("Expected PeerStatusChanged event, got {:?}", event);
+    }
 }
 
 #[tokio::test]

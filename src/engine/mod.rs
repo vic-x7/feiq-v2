@@ -2,7 +2,7 @@ pub mod actor;
 pub mod event_persister;
 pub mod handlers;
 
-pub use actor::{BroadcastEventDispatcher, CoreEngineActor};
+pub use actor::CoreEngineActor;
 pub use event_persister::EventPersister;
 
 use crate::database::{DatabaseManager, DbClient};
@@ -43,18 +43,15 @@ impl EngineHandle {
         // 2. Create Event channels
         let (event_tx, event_rx) = broadcast_channel(128);
 
-        // 3. Create Event Dispatcher (translates network callbacks into CoreEvent broadcasts)
-        let dispatcher = Arc::new(BroadcastEventDispatcher::new(event_tx.clone()));
-
-        // 4. Initialize NetworkEngine with TokioTransport
+        // 3. Initialize NetworkEngine with TokioTransport
         let transport = Arc::new(TokioTransport::bind_fallback(&config.bind_ip, config.start_port).await?);
-        let network = NetworkEngine::new(config.username, config.hostname, transport, dispatcher.clone(), max_task_id)?;
+        let network = NetworkEngine::new(config.username, config.hostname, transport, event_tx.clone(), max_task_id)?;
         let network_arc = Arc::new(network);
 
-        // 5. Create Command channels
+        // 4. Create Command channels
         let (cmd_tx, cmd_rx) = channel(64);
 
-        // 6. Spawn CoreEngineActor in a tokio task
+        // 5. Spawn CoreEngineActor in a tokio task
         let cancel = CancellationToken::new();
         let actor = CoreEngineActor::new(
             cmd_rx,
@@ -62,7 +59,6 @@ impl EngineHandle {
             network_arc.clone(),
             db_client.clone(),
             event_tx.clone(),
-            dispatcher.clone(),
             cancel.clone(),
         );
         tokio::spawn(async move {

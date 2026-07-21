@@ -89,13 +89,13 @@ fn auto_download_clipboards(
             let save_path = cache_dir.join(&att.name);
 
             let task_id = ctx.engine.next_transfer_task_id();
-            ctx.engine.event_dispatcher.on_transfer_started(
+            let _ = ctx.engine.event_tx.send(crate::types::CoreEvent::TransferStarted {
                 task_id,
-                ctx.peer_ip(),
-                att.name.clone(),
-                att.size as i64,
-                false,
-            );
+                peer_ip: ctx.peer_ip(),
+                file_name: att.name.clone(),
+                file_size: att.size as i64,
+                is_sending: false,
+            });
 
             let req = crate::types::FileDownloadRequest {
                 peer_ip: ctx.peer_ip(),
@@ -122,19 +122,20 @@ impl PacketHandler for SendMsgHandler {
         let (text_content, attachments) = parse_and_format_message(packet);
         let now = chrono::Utc::now().timestamp_millis();
 
-        ctx.engine.event_dispatcher.on_message_received(
-            ctx.peer_ip(),
-            text_content,
-            now,
-            packet.username.clone(),
-        );
+        let _ = ctx.engine.event_tx.send(crate::types::CoreEvent::MessageReceived {
+            id: 0,
+            sender_ip: ctx.peer_ip(),
+            content: text_content,
+            timestamp: now,
+            username: packet.username.clone(),
+        });
 
         if (packet.cmd & IPMSG_FILEATTACHOPT) == IPMSG_FILEATTACHOPT && !attachments.is_empty() {
-            ctx.engine.event_dispatcher.on_file_attachments_received(
-                ctx.peer_ip(),
-                packet.packet_no,
-                attachments.clone(),
-            );
+            let _ = ctx.engine.event_tx.send(crate::types::CoreEvent::FileAttachmentsReceived {
+                sender_ip: ctx.peer_ip(),
+                packet_no: packet.packet_no,
+                files: attachments.clone(),
+            });
             auto_download_clipboards(ctx, packet.packet_no, &attachments);
         }
 
@@ -163,13 +164,13 @@ impl PacketHandler for RecvMsgHandler {
 #[async_trait]
 impl PacketHandler for BrExitHandler {
     async fn handle(&self, ctx: &PacketContext, packet: &IPMsgPacket) -> Result<(), AppError> {
-        ctx.engine.event_dispatcher.on_peer_status_changed(
-            ctx.peer_ip(),
-            packet.username.clone(),
-            packet.hostname.clone(),
-            None,
-            false,
-        );
+        let _ = ctx.engine.event_tx.send(crate::types::CoreEvent::PeerStatusChanged {
+            ip: ctx.peer_ip(),
+            username: packet.username.clone(),
+            hostname: packet.hostname.clone(),
+            nickname: None,
+            online: false,
+        });
         Ok(())
     }
 }
@@ -177,9 +178,10 @@ impl PacketHandler for BrExitHandler {
 #[async_trait]
 impl PacketHandler for KnockHandler {
     async fn handle(&self, ctx: &PacketContext, packet: &IPMsgPacket) -> Result<(), AppError> {
-        ctx.engine
-            .event_dispatcher
-            .on_window_knock(ctx.peer_ip(), packet.username.clone());
+        let _ = ctx.engine.event_tx.send(crate::types::CoreEvent::WindowKnock {
+            sender_ip: ctx.peer_ip(),
+            username: packet.username.clone(),
+        });
         Ok(())
     }
 }
@@ -189,9 +191,10 @@ impl PacketHandler for InputHandler {
     async fn handle(&self, ctx: &PacketContext, packet: &IPMsgPacket) -> Result<(), AppError> {
         let cmd_base = packet.cmd & 0xFF;
         let typing = cmd_base == IPMSG_INPUTING;
-        ctx.engine
-            .event_dispatcher
-            .on_peer_typing(ctx.peer_ip(), typing);
+        let _ = ctx.engine.event_tx.send(crate::types::CoreEvent::PeerTyping {
+            sender_ip: ctx.peer_ip(),
+            typing,
+        });
         Ok(())
     }
 }
@@ -284,13 +287,13 @@ impl PacketDispatcher {
 
         // Fix redundant/racey status changed update: Only trigger online=true status update if NOT going offline.
         if cmd_base != IPMSG_BR_EXIT {
-            engine.event_dispatcher.on_peer_status_changed(
-                peer_ip.clone(),
-                packet.username.clone(),
-                packet.hostname.clone(),
-                nickname.clone(),
-                true,
-            );
+            let _ = engine.event_tx.send(crate::types::CoreEvent::PeerStatusChanged {
+                ip: peer_ip.clone(),
+                username: packet.username.clone(),
+                hostname: packet.hostname.clone(),
+                nickname: nickname.clone(),
+                online: true,
+            });
         }
 
         let ctx = PacketContext {
@@ -309,73 +312,10 @@ impl PacketDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::NetworkEvents;
-    use std::sync::Mutex;
-
-    struct TestEvents {
-        messages: Mutex<Vec<(String, String, String)>>, // (sender_ip, content, username)
-        peers: Mutex<Vec<(String, String, String, Option<String>, bool)>>, // (ip, username, hostname, nickname, online)
-    }
-
-    impl NetworkEvents for TestEvents {
-        fn on_peer_status_changed(
-            &self,
-            ip: String,
-            username: String,
-            hostname: String,
-            nickname: Option<String>,
-            online: bool,
-        ) {
-            self.peers
-                .lock()
-                .unwrap()
-                .push((ip, username, hostname, nickname, online));
-        }
-        fn on_message_received(
-            &self,
-            sender_ip: String,
-            text_content: String,
-            _timestamp: i64,
-            username: String,
-        ) {
-            self.messages
-                .lock()
-                .unwrap()
-                .push((sender_ip, text_content, username));
-        }
-        fn on_file_attachments_received(
-            &self,
-            _sender_ip: String,
-            _packet_no: u32,
-            _files: Vec<crate::protocol::FileAttachment>,
-        ) {
-        }
-        fn on_window_knock(&self, _sender_ip: String, _username: String) {}
-        fn on_peer_typing(&self, _sender_ip: String, _typing: bool) {}
-        fn on_transfer_progress(
-            &self,
-            _task_id: i64,
-            _progress: f64,
-            _status: crate::types::TransferStatus,
-        ) {
-        }
-        fn on_transfer_started(
-            &self,
-            _task_id: i64,
-            _peer_ip: String,
-            _file_name: String,
-            _file_size: i64,
-            _is_sending: bool,
-        ) {
-        }
-    }
 
     #[tokio::test]
     async fn test_send_msg_handler_no_ack() {
-        let events = Arc::new(TestEvents {
-            messages: Mutex::new(Vec::new()),
-            peers: Mutex::new(Vec::new()),
-        });
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(128);
 
         let transport = Arc::new(crate::network::FakeTransport::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -385,7 +325,7 @@ mod tests {
                 "alice".to_string(),
                 "alice-pc".to_string(),
                 transport,
-                events.clone(),
+                event_tx,
                 0,
             )
             .unwrap(),
@@ -409,19 +349,19 @@ mod tests {
         let result = handler.handle(&context, &packet).await;
         assert!(result.is_ok());
 
-        let messages = events.messages.lock().unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].0, "127.0.0.1");
-        assert_eq!(messages[0].1, "Hello from Bob!");
-        assert_eq!(messages[0].2, "bob");
+        let event = event_rx.try_recv().unwrap();
+        if let crate::types::CoreEvent::MessageReceived { sender_ip, content, username, .. } = event {
+            assert_eq!(sender_ip, "127.0.0.1");
+            assert_eq!(content, "Hello from Bob!");
+            assert_eq!(username, "bob");
+        } else {
+            panic!("Expected MessageReceived event, got {:?}", event);
+        }
     }
 
     #[tokio::test]
     async fn test_send_msg_handler_with_ack() {
-        let events = Arc::new(TestEvents {
-            messages: Mutex::new(Vec::new()),
-            peers: Mutex::new(Vec::new()),
-        });
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(128);
 
         let transport = Arc::new(crate::network::FakeTransport::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -431,7 +371,7 @@ mod tests {
                 "alice".to_string(),
                 "alice-pc".to_string(),
                 transport,
-                events.clone(),
+                event_tx,
                 0,
             )
             .unwrap(),
@@ -455,17 +395,17 @@ mod tests {
         let result = handler.handle(&context, &packet).await;
         assert!(result.is_ok());
 
-        let messages = events.messages.lock().unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].1, "ACK message");
+        let event = event_rx.try_recv().unwrap();
+        if let crate::types::CoreEvent::MessageReceived { content, .. } = event {
+            assert_eq!(content, "ACK message");
+        } else {
+            panic!("Expected MessageReceived event, got {:?}", event);
+        }
     }
 
     #[tokio::test]
     async fn test_dispatch_sanitizes_untrusted_data() {
-        let events = Arc::new(TestEvents {
-            messages: Mutex::new(Vec::new()),
-            peers: Mutex::new(Vec::new()),
-        });
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(128);
 
         let transport = Arc::new(crate::network::FakeTransport::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -475,7 +415,7 @@ mod tests {
                 "alice".to_string(),
                 "alice-pc".to_string(),
                 transport,
-                events.clone(),
+                event_tx,
                 0,
             )
             .unwrap(),
@@ -506,19 +446,23 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify status changed username and hostname were trimmed and truncated
-        let peers = events.peers.lock().unwrap();
-        assert_eq!(peers.len(), 1);
-        let (_, sanitized_user, sanitized_host, _, _) = &peers[0];
-        assert_eq!(sanitized_user.len(), 64);
-        assert_eq!(sanitized_user, &"u".repeat(64));
-        assert_eq!(sanitized_host.len(), 64);
-        assert_eq!(sanitized_host, &"h".repeat(64));
+        let event1 = event_rx.try_recv().unwrap();
+        if let crate::types::CoreEvent::PeerStatusChanged { username, hostname, .. } = event1 {
+            assert_eq!(username.len(), 64);
+            assert_eq!(username, "u".repeat(64));
+            assert_eq!(hostname.len(), 64);
+            assert_eq!(hostname, "h".repeat(64));
+        } else {
+            panic!("Expected PeerStatusChanged event, got {:?}", event1);
+        }
 
         // Verify the received message text was stripped of \x1f and terminated at \x00
-        let messages = events.messages.lock().unwrap();
-        assert_eq!(messages.len(), 1);
-        let (_, text, user) = &messages[0];
-        assert_eq!(text, "Malicious");
-        assert_eq!(user, &"u".repeat(64));
+        let event2 = event_rx.try_recv().unwrap();
+        if let crate::types::CoreEvent::MessageReceived { content, username, .. } = event2 {
+            assert_eq!(content, "Malicious");
+            assert_eq!(username, "u".repeat(64));
+        } else {
+            panic!("Expected MessageReceived event, got {:?}", event2);
+        }
     }
 }

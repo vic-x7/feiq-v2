@@ -49,46 +49,6 @@ pub trait NetworkEngineTrait: Send + Sync + 'static {
     fn next_transfer_task_id(&self) -> i64;
 }
 
-pub trait NetworkEvents: Send + Sync + 'static {
-    fn on_peer_status_changed(
-        &self,
-        ip: String,
-        username: String,
-        hostname: String,
-        nickname: Option<String>,
-        online: bool,
-    );
-    fn on_message_received(
-        &self,
-        sender_ip: String,
-        text_content: String,
-        timestamp: i64,
-        username: String,
-    );
-    fn on_file_attachments_received(
-        &self,
-        sender_ip: String,
-        packet_no: u32,
-        files: Vec<crate::protocol::FileAttachment>,
-    );
-    fn on_window_knock(&self, sender_ip: String, username: String);
-    fn on_peer_typing(&self, sender_ip: String, typing: bool);
-    fn on_transfer_progress(
-        &self,
-        task_id: i64,
-        progress: f64,
-        status: crate::types::TransferStatus,
-    );
-    fn on_transfer_started(
-        &self,
-        task_id: i64,
-        peer_ip: String,
-        file_name: String,
-        file_size: i64,
-        is_sending: bool,
-    );
-}
-
 #[async_trait]
 pub trait PacketHandler: Send + Sync + 'static {
     async fn handle(
