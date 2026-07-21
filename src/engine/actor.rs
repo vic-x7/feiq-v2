@@ -1,5 +1,5 @@
 use crate::database::DbClient;
-use crate::network::NetworkEngine;
+use crate::network::{PacketIO, PacketDispatcher};
 use crate::types::{CoreCommand, CoreEvent, CancellationToken};
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
@@ -7,27 +7,60 @@ use tokio::sync::mpsc::Receiver;
 
 pub struct CoreEngineActor {
     cmd_rx: Receiver<CoreCommand>,
-    network: Arc<NetworkEngine>,
+    packet_io: Arc<PacketIO>,
+    packet_dispatcher: Arc<PacketDispatcher>,
+    pub peer_directory: crate::network::PeerDirectory,
+    pub ack_tracker: crate::network::AckTracker,
+    pub file_registry: crate::network::FileRegistry,
     db: DbClient,
-    event_tx: Sender<CoreEvent>,
+    pub event_tx: Sender<CoreEvent>,
     cancel: CancellationToken,
 }
 
 impl CoreEngineActor {
     pub fn new(
         cmd_rx: Receiver<CoreCommand>,
-        network: Arc<NetworkEngine>,
+        packet_io: Arc<PacketIO>,
+        packet_dispatcher: Arc<PacketDispatcher>,
         db: DbClient,
         event_tx: Sender<CoreEvent>,
         cancel: CancellationToken,
     ) -> Self {
+        let peer_directory = packet_io.peer_directory.clone();
+        let ack_tracker = packet_io.ack_tracker.clone();
+        let file_registry = packet_io.file_registry.clone();
         Self {
             cmd_rx,
-            network,
+            packet_io,
+            packet_dispatcher,
+            peer_directory,
+            ack_tracker,
+            file_registry,
             db,
             event_tx,
             cancel,
         }
+    }
+
+    async fn broadcast_online(&self) -> Result<(), String> {
+        let username = self.packet_io.get_username();
+
+        // Broadcast on port range 2425..=2430 to support discovering multi-instances in LAN
+        let addrs = if let Ok(local_addr) = self.packet_io.transport.local_addr() {
+            crate::network::discovery::subnet_broadcast_addrs(local_addr)
+        } else {
+            vec!["255.255.255.255".to_string()]
+        };
+
+        for port in 2425..=2430 {
+            for addr in &addrs {
+                let _ = self
+                    .packet_io
+                    .send_packet_on_port(addr, port, crate::protocol::IPMSG_BR_ENTRY, &username)
+                    .await;
+            }
+        }
+        Ok(())
     }
 
     pub async fn run(mut self) {
@@ -52,14 +85,15 @@ impl CoreEngineActor {
         });
 
         // Spawn network engine receive loop inside actor context (this also starts run_tcp_server)
-        let network_clone = self.network.clone();
+        let io_clone = self.packet_io.clone();
+        let dispatcher_clone = self.packet_dispatcher.clone();
         let cancel_net = self.cancel.clone();
         let net_handle = tokio::spawn(async move {
-            network_clone.start_receive_loop(cancel_net).await;
+            io_clone.start_receive_loop(dispatcher_clone, cancel_net).await;
         });
 
         // Discover local peers immediately
-        if let Err(e) = self.network.broadcast_online().await {
+        if let Err(e) = self.broadcast_online().await {
             eprintln!("Warning: Failed to broadcast presence: {}", e);
         }
 
@@ -76,11 +110,7 @@ impl CoreEngineActor {
                                     self.handle_send_message(to_ip, content).await
                                 }
                                 CoreCommand::BroadcastPresence => {
-                                    if let Err(e) = self.network.broadcast_online().await {
-                                        Err(format!("Failed to broadcast presence: {}", e))
-                                    } else {
-                                        Ok(())
-                                    }
+                                    self.broadcast_online().await
                                 }
                                 CoreCommand::RegisterSharedFile { path } => {
                                     self.handle_register_shared_file(path)
@@ -113,7 +143,7 @@ impl CoreEngineActor {
 
         // When the loop exits (the actor shuts down):
         self.cancel.cancel();
-        self.network.stop();
+        self.packet_io.stop();
         let _ = tokio::join!(persist_handle, net_handle);
     }
 
@@ -124,9 +154,9 @@ impl CoreEngineActor {
         payload: &str,
         db_content: String,
     ) -> Result<(), String> {
-        let port = self.network.get_peer_port(&peer_ip);
+        let port = self.peer_directory.get_port_str(&peer_ip);
         match self
-            .network
+            .packet_io
             .send_packet_on_port(&peer_ip, port, cmd_flags, payload)
             .await
         {
@@ -166,7 +196,12 @@ impl CoreEngineActor {
     }
 
     async fn handle_update_identity(&self, username: String, hostname: String) -> Result<(), String> {
-        self.network.update_identity(username.clone(), hostname.clone());
+        if let Ok(mut u) = self.packet_io.my_username.lock() {
+            *u = username.clone();
+        }
+        if let Ok(mut h) = self.packet_io.my_hostname.lock() {
+            *h = hostname.clone();
+        }
         if let Err(e) = self
             .db
             .save_config("username".to_string(), username.clone())
@@ -193,14 +228,17 @@ impl CoreEngineActor {
                 .to_string_lossy()
                 .into_owned();
             let size = path.metadata().map(|m| m.len()).unwrap_or(0);
-            let packet_no = self.network.next_packet_no();
+            let packet_no = self.packet_io.next_packet_no();
             let file_id = 0; // Standard single file ID
-            self.network.register_shared_file(
+            let file = crate::network::SharedFile {
+                path: path.clone(),
+                name: name.clone(),
+                size,
+            };
+            self.file_registry.register(
                 packet_no,
                 file_id,
-                path.clone(),
-                name.clone(),
-                size,
+                file,
             );
             println!(
                 "Registered shared file: {} ({} bytes) under packet_no: {}, file_id: {}",
@@ -214,13 +252,38 @@ impl CoreEngineActor {
     }
 
     fn handle_scan_subnet(&self, subnet: String) -> Result<(), String> {
-        let network_inner = self.network.clone();
+        let packet_io = self.packet_io.clone();
         let cancel_clone = self.cancel.clone();
         tokio::spawn(async move {
             if cancel_clone.is_cancelled() {
                 return;
             }
-            network_inner.scan_subnet(&subnet, cancel_clone).await;
+            let ips = crate::network::discovery::subnet_ips(&subnet);
+            let username = packet_io.get_username();
+
+            for ip in ips {
+                if cancel_clone.is_cancelled() {
+                    break;
+                }
+                let io = packet_io.clone();
+                let username_clone = username.clone();
+                let cancel_inner = cancel_clone.clone();
+                tokio::spawn(async move {
+                    if cancel_inner.is_cancelled() {
+                        return;
+                    }
+                    let _ = io
+                        .send_packet(&ip, crate::protocol::IPMSG_BR_ENTRY, &username_clone)
+                        .await;
+                });
+                // 5ms throttle delay to avoid saturating network stack
+                tokio::select! {
+                    _ = cancel_clone.cancelled() => {
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                }
+            }
             println!("\n[SCAN] Subnet scan sent for {}", subnet);
         });
         Ok(())
@@ -241,7 +304,7 @@ impl CoreEngineActor {
             .unwrap_or(None)
             .unwrap_or_else(|| "downloads".to_string());
 
-        let task_id = self.network.next_transfer_task_id();
+        let task_id = self.packet_io.next_transfer_task_id();
 
         let task = crate::database::FileTaskRecord {
             id: Some(task_id),
@@ -259,7 +322,7 @@ impl CoreEngineActor {
             return Err(err_msg);
         }
 
-        let network_clone = self.network.clone();
+        let packet_io_clone = self.packet_io.clone();
         let cancel_clone = self.cancel.clone();
         tokio::spawn(async move {
             if cancel_clone.is_cancelled() {
@@ -278,7 +341,7 @@ impl CoreEngineActor {
                 file_size: size,
                 task_id,
             };
-            match network_clone.download_file_direct(download_req).await {
+            match packet_io_clone.download_file_direct(download_req).await {
                 Ok(_) => {
                     println!("\n[DOWNLOAD SUCCESS] Download complete.");
                 }
@@ -325,20 +388,23 @@ impl CoreEngineActor {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let packet_no = self.network.next_packet_no();
+        let packet_no = self.packet_io.next_packet_no();
         let file_id = 0u32;
 
         // Register file in TCP registry
-        self.network.register_shared_file(
+        let shared_file = crate::network::SharedFile {
+            path: path.clone(),
+            name: file_name.clone(),
+            size: file_size,
+        };
+        self.file_registry.register(
             packet_no,
             file_id,
-            path.clone(),
-            file_name.clone(),
-            file_size,
+            shared_file,
         );
 
         // Save to SQLite
-        let task_id = self.network.next_transfer_task_id();
+        let task_id = self.packet_io.next_transfer_task_id();
         let task_record = crate::database::FileTaskRecord {
             id: Some(task_id),
             file_name: file_name.clone(),
@@ -371,9 +437,9 @@ impl CoreEngineActor {
         let payload = format!("{}\0{}", text_content, attachment_meta);
         let cmd_flags = crate::protocol::IPMSG_SENDMSG | crate::protocol::IPMSG_FILEATTACHOPT;
 
-        let port = self.network.get_peer_port(&peer_ip);
+        let port = self.peer_directory.get_port_str(&peer_ip);
         let _ = self
-            .network
+            .packet_io
             .send_packet_on_port(&peer_ip, port, cmd_flags, &payload)
             .await;
         println!("File metadata sent to {}!", peer_ip);

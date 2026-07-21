@@ -1,6 +1,6 @@
 use feiq_v2::database::DatabaseManager;
 use feiq_v2::engine::CoreEngineActor;
-use feiq_v2::network::{FakeTransport, NetworkEngine};
+use feiq_v2::network::{FakeTransport, PacketIO, PacketDispatcher, PeerDirectory, FileRegistry, AckTracker};
 use feiq_v2::types::{CoreCommand, CancellationToken};
 use std::sync::Arc;
 use tokio::sync::broadcast::channel as broadcast_channel;
@@ -20,21 +20,28 @@ async fn test_actor_send_message() {
 
     let local_addr = "127.0.0.1:2425".parse().unwrap();
     let transport = Arc::new(FakeTransport::new(local_addr));
-    let engine = Arc::new(
-        NetworkEngine::new(
+    let peer_directory = PeerDirectory::new();
+    let file_registry = FileRegistry::new();
+    let ack_tracker = AckTracker::new();
+    let packet_dispatcher = Arc::new(PacketDispatcher::new());
+    let packet_io = Arc::new(
+        PacketIO::new(
             "alice".to_string(),
             "alice-pc".to_string(),
             transport.clone(),
             event_tx.clone(),
             0,
+            peer_directory,
+            file_registry,
+            ack_tracker,
         )
-        .unwrap(),
     );
 
     let cancel = CancellationToken::new();
     let actor = CoreEngineActor::new(
         cmd_rx,
-        engine,
+        packet_io,
+        packet_dispatcher,
         db_client.clone(),
         event_tx,
         cancel.clone(),
@@ -98,21 +105,28 @@ async fn test_actor_update_identity() {
 
     let local_addr = "127.0.0.1:2425".parse().unwrap();
     let transport = Arc::new(FakeTransport::new(local_addr));
-    let engine = Arc::new(
-        NetworkEngine::new(
+    let peer_directory = PeerDirectory::new();
+    let file_registry = FileRegistry::new();
+    let ack_tracker = AckTracker::new();
+    let packet_dispatcher = Arc::new(PacketDispatcher::new());
+    let packet_io = Arc::new(
+        PacketIO::new(
             "alice".to_string(),
             "alice-pc".to_string(),
             transport.clone(),
             event_tx.clone(),
             0,
+            peer_directory,
+            file_registry,
+            ack_tracker,
         )
-        .unwrap(),
     );
 
     let cancel = CancellationToken::new();
     let actor = CoreEngineActor::new(
         cmd_rx,
-        engine,
+        packet_io,
+        packet_dispatcher,
         db_client.clone(),
         event_tx,
         cancel.clone(),
@@ -160,21 +174,28 @@ async fn test_actor_send_knock() {
 
     let local_addr = "127.0.0.1:2425".parse().unwrap();
     let transport = Arc::new(FakeTransport::new(local_addr));
-    let engine = Arc::new(
-        NetworkEngine::new(
+    let peer_directory = PeerDirectory::new();
+    let file_registry = FileRegistry::new();
+    let ack_tracker = AckTracker::new();
+    let packet_dispatcher = Arc::new(PacketDispatcher::new());
+    let packet_io = Arc::new(
+        PacketIO::new(
             "alice".to_string(),
             "alice-pc".to_string(),
             transport.clone(),
             event_tx.clone(),
             0,
+            peer_directory,
+            file_registry,
+            ack_tracker,
         )
-        .unwrap(),
     );
 
     let cancel = CancellationToken::new();
     let actor = CoreEngineActor::new(
         cmd_rx,
-        engine,
+        packet_io,
+        packet_dispatcher,
         db_client.clone(),
         event_tx,
         cancel.clone(),

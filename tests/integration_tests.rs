@@ -46,8 +46,8 @@ async fn test_full_lifecycle_multi_instance_emulation() {
     .unwrap();
 
     // Retrieve loopback ports
-    let alice_port = alice_net.socket_local_addr().unwrap().port();
-    let bob_port = bob_net.socket_local_addr().unwrap().port();
+    let alice_port = alice_net.transport.local_addr().unwrap().port();
+    let bob_port = bob_net.transport.local_addr().unwrap().port();
 
     println!(
         "Alice bound on port {}, Bob bound on port {}",
@@ -55,8 +55,8 @@ async fn test_full_lifecycle_multi_instance_emulation() {
     );
 
     // Manually cross-register peer ports in memory so they know how to communicate back and forth
-    alice_net.register_peer_port("127.0.0.1", bob_port);
-    bob_net.register_peer_port("127.0.0.1", alice_port);
+    alice_net.peer_directory.upsert_str("127.0.0.1", bob_port);
+    bob_net.peer_directory.upsert_str("127.0.0.1", alice_port);
 
     // 4. Trigger peer discovery manually
     // Alice sends entry packet directly to Bob's bound loopback port
@@ -379,12 +379,12 @@ async fn test_classic_feiq_features_emulation() {
     .await
     .unwrap();
 
-    let alice_port = alice_net.socket_local_addr().unwrap().port();
-    let bob_port = bob_net.socket_local_addr().unwrap().port();
+    let alice_port = alice_net.transport.local_addr().unwrap().port();
+    let bob_port = bob_net.transport.local_addr().unwrap().port();
 
     // Register peer ports
-    alice_net.register_peer_port("127.0.0.1", bob_port);
-    bob_net.register_peer_port("127.0.0.1", alice_port);
+    alice_net.peer_directory.upsert_str("127.0.0.1", bob_port);
+    bob_net.peer_directory.upsert_str("127.0.0.1", alice_port);
 
     // 3. Test Typing: Alice is typing (IPMSG_INPUTING) -> Bob receives typing event
     alice_net

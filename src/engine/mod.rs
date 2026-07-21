@@ -5,7 +5,7 @@ pub use actor::CoreEngineActor;
 pub use event_persister::EventPersister;
 
 use crate::database::{DatabaseManager, DbClient};
-use crate::network::{NetworkEngine, TokioTransport};
+use crate::network::{PacketIO, TokioTransport, PacketDispatcher, PeerDirectory, FileRegistry, AckTracker};
 use crate::types::{CoreCommand, CoreEvent, CancellationToken};
 use crate::error::AppError;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ pub struct EngineHandle {
     event_tx: BroadcastSender<CoreEvent>,
     event_rx: BroadcastReceiver<CoreEvent>,
     db: DbClient,
-    network: Arc<NetworkEngine>,
+    packet_io: Arc<PacketIO>,
     cancel: CancellationToken,
 }
 
@@ -42,10 +42,23 @@ impl EngineHandle {
         // 2. Create Event channels
         let (event_tx, event_rx) = broadcast_channel(128);
 
-        // 3. Initialize NetworkEngine with TokioTransport
+        // 3. Initialize Network components
         let transport = Arc::new(TokioTransport::bind_fallback(&config.bind_ip, config.start_port).await?);
-        let network = NetworkEngine::new(config.username, config.hostname, transport, event_tx.clone(), max_task_id)?;
-        let network_arc = Arc::new(network);
+        let peer_directory = PeerDirectory::new();
+        let file_registry = FileRegistry::new();
+        let ack_tracker = AckTracker::new();
+        let packet_dispatcher = Arc::new(PacketDispatcher::new());
+
+        let packet_io = Arc::new(PacketIO::new(
+            config.username,
+            config.hostname,
+            transport,
+            event_tx.clone(),
+            max_task_id,
+            peer_directory,
+            file_registry,
+            ack_tracker,
+        ));
 
         // 4. Create Command channels
         let (cmd_tx, cmd_rx) = channel(64);
@@ -54,7 +67,8 @@ impl EngineHandle {
         let cancel = CancellationToken::new();
         let actor = CoreEngineActor::new(
             cmd_rx,
-            network_arc.clone(),
+            packet_io.clone(),
+            packet_dispatcher,
             db_client.clone(),
             event_tx.clone(),
             cancel.clone(),
@@ -68,7 +82,7 @@ impl EngineHandle {
             event_tx,
             event_rx,
             db: db_client,
-            network: network_arc,
+            packet_io,
             cancel,
         })
     }
@@ -89,19 +103,19 @@ impl EngineHandle {
 
     pub fn shutdown(&self) {
         self.cancel.cancel();
-        self.network.stop();
+        self.packet_io.stop();
     }
 
     pub fn subscribe(&self) -> BroadcastReceiver<CoreEvent> {
         self.event_rx.resubscribe()
     }
 
-    pub fn network(&self) -> &Arc<NetworkEngine> {
-        &self.network
+    pub fn network(&self) -> &Arc<PacketIO> {
+        &self.packet_io
     }
 
     pub fn stats(&self) -> crate::network::EngineStats {
-        self.network.stats()
+        self.packet_io.stats()
     }
 
     pub fn drain_events<F: FnMut(CoreEvent)>(&mut self, mut handler: F) -> bool {
@@ -138,7 +152,7 @@ pub async fn start_engine(
         MpscSender<CoreCommand>,
         BroadcastSender<CoreEvent>,
         BroadcastReceiver<CoreEvent>,
-        Arc<NetworkEngine>,
+        Arc<PacketIO>,
         DbClient,
     ),
     AppError,
@@ -155,7 +169,7 @@ pub async fn start_engine(
         handle.cmd_tx(),
         handle.event_tx.clone(),
         handle.event_tx.subscribe(),
-        handle.network.clone(),
+        handle.packet_io.clone(),
         handle.db().clone(),
     ))
 }
@@ -203,7 +217,7 @@ mod tests {
 
         // Verify we can access the underlying network engine
         let net = engine.network();
-        assert!(net.socket_local_addr().is_ok());
+        assert!(net.transport.local_addr().is_ok());
 
         // Shutdown cleanly
         engine.shutdown();

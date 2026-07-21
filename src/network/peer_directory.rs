@@ -1,18 +1,19 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub fn ip_to_u32(ip: &str) -> u32 {
     ip.parse::<std::net::Ipv4Addr>().map(u32::from).unwrap_or(0)
 }
 
+#[derive(Clone)]
 pub struct PeerDirectory {
-    peer_ports: Mutex<HashMap<u32, u16>>,
+    peer_ports: Arc<Mutex<HashMap<u32, u16>>>,
 }
 
 impl PeerDirectory {
     pub fn new() -> Self {
         Self {
-            peer_ports: Mutex::new(HashMap::new()),
+            peer_ports: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

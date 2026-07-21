@@ -1,5 +1,5 @@
 use feiq_v2::database::DatabaseManager;
-use feiq_v2::network::NetworkEngine;
+use feiq_v2::network::{PacketIO, PeerDirectory, FileRegistry, AckTracker};
 use feiq_v2::types::{FileDownloadRequest, CancellationToken};
 use std::sync::Arc;
 
@@ -14,20 +14,21 @@ async fn test_network_engine_binding_and_fallback() {
             .await
             .unwrap(),
     );
-    let engine1 = NetworkEngine::new(
+    let peer_directory1 = PeerDirectory::new();
+    let file_registry1 = FileRegistry::new();
+    let ack_tracker1 = AckTracker::new();
+    let engine1 = PacketIO::new(
         "alice".to_string(),
         "alice-pc".to_string(),
         transport1,
         event_tx1,
         0,
+        peer_directory1,
+        file_registry1,
+        ack_tracker1,
     );
 
-    assert!(
-        engine1.is_ok(),
-        "Failed to bind first engine: {:?}",
-        engine1.err()
-    );
-    let engine1 = engine1.unwrap();
+    let engine1 = Arc::new(engine1);
 
     // 2. Create second network engine on the same loopback IP
     // Since port 2425 is already bound by engine1, engine2 MUST fall back to a port in range 2426..=2435!
@@ -36,24 +37,25 @@ async fn test_network_engine_binding_and_fallback() {
             .await
             .unwrap(),
     );
-    let engine2 = NetworkEngine::new(
+    let peer_directory2 = PeerDirectory::new();
+    let file_registry2 = FileRegistry::new();
+    let ack_tracker2 = AckTracker::new();
+    let engine2 = PacketIO::new(
         "bob".to_string(),
         "bob-pc".to_string(),
         transport2,
         event_tx2,
         0,
+        peer_directory2,
+        file_registry2,
+        ack_tracker2,
     );
 
-    assert!(
-        engine2.is_ok(),
-        "Failed to bind second engine: {:?}",
-        engine2.err()
-    );
-    let engine2 = engine2.unwrap();
+    let engine2 = Arc::new(engine2);
 
     // 3. Verify that engine1 and engine2 are bound to different loopback UDP ports in IPMsg range
-    let addr1 = engine1.socket_local_addr().unwrap();
-    let addr2 = engine2.socket_local_addr().unwrap();
+    let addr1 = engine1.transport.local_addr().unwrap();
+    let addr2 = engine2.transport.local_addr().unwrap();
 
     assert_eq!(addr1.ip().to_string(), "127.0.0.1");
     assert_eq!(addr2.ip().to_string(), "127.0.0.1");
@@ -97,15 +99,20 @@ async fn test_network_file_transfer_loopback() {
             .await
             .unwrap(),
     );
+    let peer_directory_bob = PeerDirectory::new();
+    let file_registry_bob = FileRegistry::new();
+    let ack_tracker_bob = AckTracker::new();
     let bob = Arc::new(
-        NetworkEngine::new(
+        PacketIO::new(
             "bob".to_string(),
             "bob-pc".to_string(),
             transport_bob,
             event_tx_bob,
             0,
+            peer_directory_bob,
+            file_registry_bob,
+            ack_tracker_bob,
         )
-        .unwrap(),
     );
 
     let transport_alice = Arc::new(
@@ -113,49 +120,59 @@ async fn test_network_file_transfer_loopback() {
             .await
             .unwrap(),
     );
+    let peer_directory_alice = PeerDirectory::new();
+    let file_registry_alice = FileRegistry::new();
+    let ack_tracker_alice = AckTracker::new();
     let alice = Arc::new(
-        NetworkEngine::new(
+        PacketIO::new(
             "alice".to_string(),
             "alice-pc".to_string(),
             transport_alice,
             event_tx_alice,
             0,
+            peer_directory_alice,
+            file_registry_alice,
+            ack_tracker_alice,
         )
-        .unwrap(),
     );
 
     // Record Alice's port into Bob's known list, and Bob's port into Alice's list
-    let bob_port = bob.socket_local_addr().unwrap().port();
-    let alice_port = alice.socket_local_addr().unwrap().port();
+    let bob_port = bob.transport.local_addr().unwrap().port();
+    let alice_port = alice.transport.local_addr().unwrap().port();
 
     // Register peer ports manually to skip discovery sequence for this socket unit test
-    alice.register_peer_port("127.0.0.1", bob_port);
-    bob.register_peer_port("127.0.0.1", alice_port);
+    alice.peer_directory.upsert_str("127.0.0.1", bob_port);
+    bob.peer_directory.upsert_str("127.0.0.1", alice_port);
 
     // Spawn receive loops for both nodes (this automatically spawns their TCP servers)
     let bob_clone = bob.clone();
     let cancel_bob = CancellationToken::new();
     let cancel_bob_clone = cancel_bob.clone();
+    let dispatcher_bob = Arc::new(feiq_v2::network::PacketDispatcher::new());
     let handle_bob = tokio::spawn(async move {
-        bob_clone.start_receive_loop(cancel_bob_clone).await;
+        bob_clone.start_receive_loop(dispatcher_bob, cancel_bob_clone).await;
     });
 
     let alice_clone = alice.clone();
     let cancel_alice = CancellationToken::new();
     let cancel_alice_clone = cancel_alice.clone();
+    let dispatcher_alice = Arc::new(feiq_v2::network::PacketDispatcher::new());
     let handle_alice = tokio::spawn(async move {
-        alice_clone.start_receive_loop(cancel_alice_clone).await;
+        alice_clone.start_receive_loop(dispatcher_alice, cancel_alice_clone).await;
     });
 
     // Bob registers the shared file
     let packet_no = 42u32;
     let file_id = 0u32;
-    bob.register_shared_file(
+    let file = feiq_v2::network::SharedFile {
+        path: source_path.clone(),
+        name: "source.txt".to_string(),
+        size: test_content.len() as u64,
+    };
+    bob.file_registry.register(
         packet_no,
         file_id,
-        source_path.clone(),
-        "source.txt".to_string(),
-        test_content.len() as u64,
+        file,
     );
 
     // Create FileTask record on Alice's (receiver) side
@@ -262,25 +279,30 @@ async fn test_tokio_transport_udp_sending_and_parsing() {
 
 #[tokio::test]
 async fn test_fake_transport_injection_and_behavior() {
-    use feiq_v2::network::{FakeTransport, NetworkEngine};
+    use feiq_v2::network::{FakeTransport, PacketIO};
 
     let local_addr = "127.0.0.1:12345".parse().unwrap();
     let transport = Arc::new(FakeTransport::new(local_addr));
     let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(128);
 
+    let peer_directory = PeerDirectory::new();
+    let file_registry = FileRegistry::new();
+    let ack_tracker = AckTracker::new();
     let engine = Arc::new(
-        NetworkEngine::new(
+        PacketIO::new(
             "alice".to_string(),
             "alice-pc".to_string(),
             transport.clone(),
             event_tx,
             0,
+            peer_directory,
+            file_registry,
+            ack_tracker,
         )
-        .unwrap(),
     );
 
     // 1. Verify we can get local_addr from engine delegation correctly
-    assert_eq!(engine.socket_local_addr().unwrap(), local_addr);
+    assert_eq!(engine.transport.local_addr().unwrap(), local_addr);
 
     // 2. Verify sending a packet captures it in the FakeTransport
     let packet_no = engine
@@ -302,8 +324,9 @@ async fn test_fake_transport_injection_and_behavior() {
 
     // Let's spawn a quick test task or directly dispatch
     let packet = feiq_v2::protocol::IPMsgPacket::parse(raw_packet).unwrap();
-    engine
-        .handle_incoming_packet(peer_addr.ip(), 0xC0A801C8, packet)
+    let dispatcher = feiq_v2::network::PacketDispatcher::new();
+    dispatcher
+        .dispatch(engine, peer_addr.ip(), 0xC0A801C8, packet)
         .await
         .unwrap();
 

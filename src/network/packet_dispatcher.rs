@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::AppError;
-use super::{NetworkEngine, PacketContext, PacketHandler};
+use super::{PacketIO, PacketContext, PacketHandler};
 use crate::protocol::{
-    parse_file_attachments, IPMsgPacket, IPMSG_ANSENTRY, IPMSG_BR_ENTRY, IPMSG_BR_EXIT,
-    IPMSG_FILEATTACHOPT, IPMSG_FILE_CLIPBOARD, IPMSG_INPUTING, IPMSG_INPUT_END, IPMSG_KNOCK,
+    IPMsgPacket, IPMSG_ANSENTRY, IPMSG_BR_ENTRY, IPMSG_BR_EXIT,
+    IPMSG_FILEATTACHOPT, IPMSG_INPUTING, IPMSG_INPUT_END, IPMSG_KNOCK,
     IPMSG_RECVMSG, IPMSG_SENDCHECKOPT, IPMSG_SENDMSG,
 };
 
@@ -17,14 +17,57 @@ pub struct BrExitHandler;
 pub struct KnockHandler;
 pub struct InputHandler;
 
+fn auto_download_clipboards(
+    attachments: &[crate::protocol::FileAttachment],
+    packet_no: u32,
+    peer_ip: &str,
+    packet_io: &Arc<PacketIO>,
+) {
+    let clipboards = crate::protocol::get_clipboard_downloads(attachments);
+    for att in clipboards {
+        let cache_dir = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("image_cache");
+        if !cache_dir.exists() {
+            let _ = std::fs::create_dir_all(&cache_dir);
+        }
+        let save_path = cache_dir.join(&att.name);
+
+        let task_id = packet_io.next_transfer_task_id();
+        let _ = packet_io.event_tx.send(crate::types::CoreEvent::TransferStarted {
+            task_id,
+            peer_ip: peer_ip.to_string(),
+            file_name: att.name.clone(),
+            file_size: att.size as i64,
+            is_sending: false,
+        });
+
+        let req = crate::types::FileDownloadRequest {
+            peer_ip: peer_ip.to_string(),
+            packet_no,
+            file_id: att.id,
+            file_size: att.size,
+            save_path,
+            task_id,
+        };
+
+        let io_clone = packet_io.clone();
+        tokio::spawn(async move {
+            if let Err(e) = io_clone.download_file_direct(req).await {
+                eprintln!("Auto-download of inline clipboard image failed: {}", e);
+            }
+        });
+    }
+}
+
 #[async_trait]
 impl PacketHandler for BrEntryHandler {
     async fn handle(&self, ctx: &PacketContext, packet: &IPMsgPacket) -> Result<(), AppError> {
         let cmd_base = packet.cmd & 0xFF;
         if cmd_base == IPMSG_BR_ENTRY {
-            let my_username = ctx.engine.my_username.lock().unwrap().clone();
+            let my_username = ctx.packet_io.get_username();
             let _ = ctx
-                .engine
+                .packet_io
                 .send_packet(&ctx.peer_ip(), IPMSG_ANSENTRY, &my_username)
                 .await;
         }
@@ -32,97 +75,13 @@ impl PacketHandler for BrEntryHandler {
     }
 }
 
-/// Extracts Null-separated attachments and trims custom font styling from messages.
-fn parse_and_format_message(
-    packet: &IPMsgPacket,
-) -> (String, Vec<crate::protocol::FileAttachment>) {
-    let mut text_content = packet.extra.clone();
-    let mut attachments = Vec::new();
-
-    if packet.extra.contains('\0') {
-        let parts: Vec<&str> = packet.extra.splitn(2, '\0').collect();
-        text_content = parts[0].to_string();
-        attachments = parse_file_attachments(parts[1]);
-    }
-
-    if let Some(pos) = text_content.find('{') {
-        text_content.truncate(pos);
-    }
-
-    // Sanitize the raw user message text
-    text_content = super::validation::sanitize_message(&text_content);
-
-    // Sanitize file attachment names to prevent path traversal or giant filenames
-    for att in &mut attachments {
-        att.name = super::validation::sanitize_filename(&att.name);
-    }
-
-    if (packet.cmd & IPMSG_FILEATTACHOPT) == IPMSG_FILEATTACHOPT && !attachments.is_empty() {
-        for att in &attachments {
-            let size_str = crate::protocol::format_file_size(att.size);
-            let file_line = format!("Shared a file: {} ({})", att.name, size_str);
-            if text_content.is_empty() {
-                text_content = file_line;
-            } else {
-                text_content = format!("{}\n{}", text_content, file_line);
-            }
-        }
-    }
-
-    (text_content, attachments)
-}
-
-/// Automatically handles parallel disk caching and download queues for clipboard media files.
-fn auto_download_clipboards(
-    ctx: &PacketContext,
-    packet_no: u32,
-    attachments: &[crate::protocol::FileAttachment],
-) {
-    for att in attachments {
-        if (att.file_type & IPMSG_FILE_CLIPBOARD) == IPMSG_FILE_CLIPBOARD {
-            let cache_dir = std::env::current_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                .join("image_cache");
-            if !cache_dir.exists() {
-                let _ = std::fs::create_dir_all(&cache_dir);
-            }
-            let save_path = cache_dir.join(&att.name);
-
-            let task_id = ctx.engine.next_transfer_task_id();
-            let _ = ctx.engine.event_tx.send(crate::types::CoreEvent::TransferStarted {
-                task_id,
-                peer_ip: ctx.peer_ip(),
-                file_name: att.name.clone(),
-                file_size: att.size as i64,
-                is_sending: false,
-            });
-
-            let req = crate::types::FileDownloadRequest {
-                peer_ip: ctx.peer_ip(),
-                packet_no,
-                file_id: att.id,
-                file_size: att.size,
-                save_path,
-                task_id,
-            };
-
-            let engine_clone = ctx.engine.clone();
-            tokio::spawn(async move {
-                if let Err(e) = engine_clone.download_file_direct(req).await {
-                    eprintln!("Auto-download of inline clipboard image failed: {}", e);
-                }
-            });
-        }
-    }
-}
-
 #[async_trait]
 impl PacketHandler for SendMsgHandler {
     async fn handle(&self, ctx: &PacketContext, packet: &IPMsgPacket) -> Result<(), AppError> {
-        let (text_content, attachments) = parse_and_format_message(packet);
+        let (text_content, attachments) = crate::protocol::parse_incoming_message(packet);
         let now = chrono::Utc::now().timestamp_millis();
 
-        let _ = ctx.engine.event_tx.send(crate::types::CoreEvent::MessageReceived {
+        let _ = ctx.packet_io.event_tx.send(crate::types::CoreEvent::MessageReceived {
             id: 0,
             sender_ip: ctx.peer_ip(),
             content: text_content,
@@ -131,18 +90,18 @@ impl PacketHandler for SendMsgHandler {
         });
 
         if (packet.cmd & IPMSG_FILEATTACHOPT) == IPMSG_FILEATTACHOPT && !attachments.is_empty() {
-            let _ = ctx.engine.event_tx.send(crate::types::CoreEvent::FileAttachmentsReceived {
+            let _ = ctx.packet_io.event_tx.send(crate::types::CoreEvent::FileAttachmentsReceived {
                 sender_ip: ctx.peer_ip(),
                 packet_no: packet.packet_no,
                 files: attachments.clone(),
             });
-            auto_download_clipboards(ctx, packet.packet_no, &attachments);
+            auto_download_clipboards(&attachments, packet.packet_no, &ctx.peer_ip(), &ctx.packet_io);
         }
 
         if (packet.cmd & IPMSG_SENDCHECKOPT) == IPMSG_SENDCHECKOPT {
             let ack_extra = format!("{}", packet.packet_no);
             let _ = ctx
-                .engine
+                .packet_io
                 .send_packet(&ctx.peer_ip(), IPMSG_RECVMSG, &ack_extra)
                 .await;
         }
@@ -155,7 +114,7 @@ impl PacketHandler for SendMsgHandler {
 impl PacketHandler for RecvMsgHandler {
     async fn handle(&self, ctx: &PacketContext, packet: &IPMsgPacket) -> Result<(), AppError> {
         if let Ok(ack_no) = packet.extra.trim().parse::<u32>() {
-            ctx.engine.ack_tracker.ack(ack_no).await;
+            ctx.packet_io.ack_tracker.ack(ack_no).await;
         }
         Ok(())
     }
@@ -164,7 +123,7 @@ impl PacketHandler for RecvMsgHandler {
 #[async_trait]
 impl PacketHandler for BrExitHandler {
     async fn handle(&self, ctx: &PacketContext, packet: &IPMsgPacket) -> Result<(), AppError> {
-        let _ = ctx.engine.event_tx.send(crate::types::CoreEvent::PeerStatusChanged {
+        let _ = ctx.packet_io.event_tx.send(crate::types::CoreEvent::PeerStatusChanged {
             ip: ctx.peer_ip(),
             username: packet.username.clone(),
             hostname: packet.hostname.clone(),
@@ -178,7 +137,7 @@ impl PacketHandler for BrExitHandler {
 #[async_trait]
 impl PacketHandler for KnockHandler {
     async fn handle(&self, ctx: &PacketContext, packet: &IPMsgPacket) -> Result<(), AppError> {
-        let _ = ctx.engine.event_tx.send(crate::types::CoreEvent::WindowKnock {
+        let _ = ctx.packet_io.event_tx.send(crate::types::CoreEvent::WindowKnock {
             sender_ip: ctx.peer_ip(),
             username: packet.username.clone(),
         });
@@ -191,7 +150,7 @@ impl PacketHandler for InputHandler {
     async fn handle(&self, ctx: &PacketContext, packet: &IPMsgPacket) -> Result<(), AppError> {
         let cmd_base = packet.cmd & 0xFF;
         let typing = cmd_base == IPMSG_INPUTING;
-        let _ = ctx.engine.event_tx.send(crate::types::CoreEvent::PeerTyping {
+        let _ = ctx.packet_io.event_tx.send(crate::types::CoreEvent::PeerTyping {
             sender_ip: ctx.peer_ip(),
             typing,
         });
@@ -230,7 +189,7 @@ impl PacketDispatcher {
 
     pub async fn dispatch(
         &self,
-        engine: Arc<NetworkEngine>,
+        packet_io: Arc<PacketIO>,
         peer_ip_addr: std::net::IpAddr,
         ip_u32: u32,
         mut packet: IPMsgPacket,
@@ -269,7 +228,7 @@ impl PacketDispatcher {
             {
                 let ack_extra = format!("{}", packet.packet_no);
                 let peer_ip = peer_ip_addr.to_string();
-                let _ = engine
+                let _ = packet_io
                     .send_packet(&peer_ip, IPMSG_RECVMSG, &ack_extra)
                     .await;
             }
@@ -287,7 +246,7 @@ impl PacketDispatcher {
 
         // Fix redundant/racey status changed update: Only trigger online=true status update if NOT going offline.
         if cmd_base != IPMSG_BR_EXIT {
-            let _ = engine.event_tx.send(crate::types::CoreEvent::PeerStatusChanged {
+            let _ = packet_io.event_tx.send(crate::types::CoreEvent::PeerStatusChanged {
                 ip: peer_ip.clone(),
                 username: packet.username.clone(),
                 hostname: packet.hostname.clone(),
@@ -298,7 +257,7 @@ impl PacketDispatcher {
 
         let ctx = PacketContext {
             peer_ip_addr,
-            engine,
+            packet_io,
         };
 
         if let Some(handler) = self.handlers.get(&cmd_base) {
@@ -320,20 +279,25 @@ mod tests {
         let transport = Arc::new(crate::network::FakeTransport::new(
             "127.0.0.1:0".parse().unwrap(),
         ));
-        let engine = Arc::new(
-            NetworkEngine::new(
+        let peer_directory = crate::network::PeerDirectory::new();
+        let file_registry = crate::network::FileRegistry::new();
+        let ack_tracker = crate::network::AckTracker::new();
+        let packet_io = Arc::new(
+            PacketIO::new(
                 "alice".to_string(),
                 "alice-pc".to_string(),
                 transport,
                 event_tx,
                 0,
+                peer_directory,
+                file_registry,
+                ack_tracker,
             )
-            .unwrap(),
         );
 
         let context = PacketContext {
             peer_ip_addr: "127.0.0.1".parse().unwrap(),
-            engine,
+            packet_io,
         };
 
         let packet = IPMsgPacket {
@@ -366,20 +330,25 @@ mod tests {
         let transport = Arc::new(crate::network::FakeTransport::new(
             "127.0.0.1:0".parse().unwrap(),
         ));
-        let engine = Arc::new(
-            NetworkEngine::new(
+        let peer_directory = crate::network::PeerDirectory::new();
+        let file_registry = crate::network::FileRegistry::new();
+        let ack_tracker = crate::network::AckTracker::new();
+        let packet_io = Arc::new(
+            PacketIO::new(
                 "alice".to_string(),
                 "alice-pc".to_string(),
                 transport,
                 event_tx,
                 0,
+                peer_directory,
+                file_registry,
+                ack_tracker,
             )
-            .unwrap(),
         );
 
         let context = PacketContext {
             peer_ip_addr: "127.0.0.1".parse().unwrap(),
-            engine,
+            packet_io,
         };
 
         let packet = IPMsgPacket {
@@ -410,15 +379,20 @@ mod tests {
         let transport = Arc::new(crate::network::FakeTransport::new(
             "127.0.0.1:0".parse().unwrap(),
         ));
-        let engine = Arc::new(
-            NetworkEngine::new(
+        let peer_directory = crate::network::PeerDirectory::new();
+        let file_registry = crate::network::FileRegistry::new();
+        let ack_tracker = crate::network::AckTracker::new();
+        let packet_io = Arc::new(
+            PacketIO::new(
                 "alice".to_string(),
                 "alice-pc".to_string(),
                 transport,
                 event_tx,
                 0,
+                peer_directory,
+                file_registry,
+                ack_tracker,
             )
-            .unwrap(),
         );
 
         let dispatcher = PacketDispatcher::new();
@@ -437,7 +411,7 @@ mod tests {
         };
 
         let result = dispatcher.dispatch(
-            engine,
+            packet_io,
             "127.0.0.1".parse().unwrap(),
             127 * 256 * 256 * 256 + 1,
             packet,

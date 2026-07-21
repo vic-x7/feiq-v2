@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -9,14 +9,15 @@ pub struct SharedFile {
     pub size: u64,
 }
 
+#[derive(Clone)]
 pub struct FileRegistry {
-    files: Mutex<HashMap<String, SharedFile>>,
+    files: Arc<Mutex<HashMap<String, SharedFile>>>,
 }
 
 impl FileRegistry {
     pub fn new() -> Self {
         Self {
-            files: Mutex::new(HashMap::new()),
+            files: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
