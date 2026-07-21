@@ -5,7 +5,7 @@ pub mod handlers;
 pub use actor::{BroadcastEventDispatcher, CoreEngineActor};
 pub use event_persister::EventPersister;
 
-use crate::database::{start_db_actor, DatabaseManager, DbClient};
+use crate::database::{DatabaseManager, DbClient};
 use crate::network::{NetworkEngine, TokioTransport};
 use crate::types::{CoreCommand, CoreEvent, CancellationToken};
 use crate::error::AppError;
@@ -38,7 +38,7 @@ impl EngineHandle {
         // 1. Initialize SQLite Database Manager & start actor
         let db = DatabaseManager::new(config.db_path)?;
         let max_task_id = db.get_max_file_task_id().unwrap_or(0);
-        let (db_client, _db_join_handle) = start_db_actor(db);
+        let db_client = DbClient::new(db);
 
         // 2. Create Event channels
         let (event_tx, event_rx) = broadcast_channel(128);

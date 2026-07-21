@@ -454,107 +454,105 @@ impl DatabaseManager {
     }
 }
 
-macro_rules! db_commands {
-    (
-        $(
-            $variant:ident, $method:ident ( $( $arg:ident : $arg_ty:ty => $call_expr:expr ),* ) -> Result<$ret:ty, AppError>;
-        )*
-    ) => {
-        pub enum DbCommand {
-            $(
-                $variant {
-                    $( $arg: $arg_ty, )*
-                    responder: tokio::sync::oneshot::Sender<Result<$ret, AppError>>,
-                },
-            )*
-        }
-
-        impl DbActor {
-            pub async fn run(mut self) {
-                while let Some(cmd) = self.rx.recv().await {
-                    match cmd {
-                        $(
-                            DbCommand::$variant { $( $arg, )* responder } => {
-                                let res = self.manager.$method( $( $call_expr ),* );
-                                let _ = responder.send(res);
-                            }
-                        )*
-                    }
-                }
-            }
-        }
-
-        impl DbClient {
-            $(
-                pub async fn $method(&self, $( $arg: $arg_ty ),* ) -> Result<$ret, AppError> {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    self.tx
-                        .send(DbCommand::$variant {
-                            $( $arg, )*
-                            responder: tx,
-                        })
-                        .await
-                        .map_err(|e| AppError::Other(e.to_string()))?;
-                    rx.await.map_err(|e| AppError::Other(e.to_string()))?
-                }
-            )*
-        }
-    };
-}
-
-db_commands! {
-    SavePeer, save_peer(peer: PeerRecord => &peer) -> Result<(), AppError>;
-    GetPeers, get_peers() -> Result<Vec<PeerRecord>, AppError>;
-    SaveMessage, save_message(msg: MessageRecord => &msg) -> Result<i64, AppError>;
-    GetChatHistory, get_chat_history(peer_ip: String => &peer_ip, limit: i64 => limit, offset: i64 => offset) -> Result<Vec<MessageRecord>, AppError>;
-    SaveSubnets, save_subnets(subnets: Vec<String> => &subnets) -> Result<(), AppError>;
-    GetSubnets, get_subnets() -> Result<Vec<String>, AppError>;
-    CreateFileTask, create_file_task(task: FileTaskRecord => &task) -> Result<i64, AppError>;
-    UpdateFileTaskProgress, update_file_task_progress(id: i64 => id, progress: f64 => progress, status: crate::types::TransferStatus => status) -> Result<(), AppError>;
-    GetFileTaskStatus, get_file_task_status(id: i64 => id) -> Result<Option<(crate::types::TransferStatus, f64)>, AppError>;
-    SaveConfig, save_config(key: String => &key, value: String => &value) -> Result<(), AppError>;
-    GetConfig, get_config(key: String => &key) -> Result<Option<String>, AppError>;
-    GetTotalMessagesCount, get_total_messages_count() -> Result<i64, AppError>;
-    GetTotalFileTransfersCount, get_total_file_transfers_count() -> Result<i64, AppError>;
-    GetMaxFileTaskId, get_max_file_task_id() -> Result<i64, AppError>;
-    SaveActiveSession, save_active_session(peer_ip: String => &peer_ip, last_updated_at: i64 => last_updated_at) -> Result<(), AppError>;
-    GetActiveSessions, get_active_sessions() -> Result<Vec<String>, AppError>;
-    DeleteActiveSession, delete_active_session(peer_ip: String => &peer_ip) -> Result<(), AppError>;
-}
-
-pub struct DbActor {
-    manager: DatabaseManager,
-    rx: tokio::sync::mpsc::Receiver<DbCommand>,
-}
-
-impl DbActor {
-    pub fn new(manager: DatabaseManager, rx: tokio::sync::mpsc::Receiver<DbCommand>) -> Self {
-        Self { manager, rx }
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DbClient {
-    tx: tokio::sync::mpsc::Sender<DbCommand>,
+    db: std::sync::Arc<std::sync::Mutex<DatabaseManager>>,
+}
+
+impl std::fmt::Debug for DbClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbClient").finish_non_exhaustive()
+    }
 }
 
 impl DbClient {
-    pub fn new(tx: tokio::sync::mpsc::Sender<DbCommand>) -> Self {
-        Self { tx }
+    pub fn new(manager: DatabaseManager) -> Self {
+        Self {
+            db: std::sync::Arc::new(std::sync::Mutex::new(manager)),
+        }
     }
 
-    pub fn inner_sender(&self) -> tokio::sync::mpsc::Sender<DbCommand> {
-        self.tx.clone()
+    async fn run_blocking<F, R>(&self, f: F) -> Result<R, AppError>
+    where
+        F: FnOnce(&DatabaseManager) -> Result<R, AppError> + Send + 'static,
+        R: Send + 'static,
+    {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = db.lock().unwrap();
+            f(&*guard)
+        })
+        .await
+        .map_err(|e| AppError::Other(e.to_string()))?
     }
-}
 
-pub fn start_db_actor(manager: DatabaseManager) -> (DbClient, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = tokio::sync::mpsc::channel(100);
-    let actor = DbActor::new(manager, rx);
-    let handle = tokio::spawn(async move {
-        actor.run().await;
-    });
-    (DbClient::new(tx), handle)
+    pub async fn save_peer(&self, peer: PeerRecord) -> Result<(), AppError> {
+        self.run_blocking(move |db| db.save_peer(&peer)).await
+    }
+
+    pub async fn get_peers(&self) -> Result<Vec<PeerRecord>, AppError> {
+        self.run_blocking(move |db| db.get_peers()).await
+    }
+
+    pub async fn save_message(&self, msg: MessageRecord) -> Result<i64, AppError> {
+        self.run_blocking(move |db| db.save_message(&msg)).await
+    }
+
+    pub async fn get_chat_history(&self, peer_ip: String, limit: i64, offset: i64) -> Result<Vec<MessageRecord>, AppError> {
+        self.run_blocking(move |db| db.get_chat_history(&peer_ip, limit, offset)).await
+    }
+
+    pub async fn save_subnets(&self, subnets: Vec<String>) -> Result<(), AppError> {
+        self.run_blocking(move |db| db.save_subnets(&subnets)).await
+    }
+
+    pub async fn get_subnets(&self) -> Result<Vec<String>, AppError> {
+        self.run_blocking(move |db| db.get_subnets()).await
+    }
+
+    pub async fn create_file_task(&self, task: FileTaskRecord) -> Result<i64, AppError> {
+        self.run_blocking(move |db| db.create_file_task(&task)).await
+    }
+
+    pub async fn update_file_task_progress(&self, id: i64, progress: f64, status: crate::types::TransferStatus) -> Result<(), AppError> {
+        self.run_blocking(move |db| db.update_file_task_progress(id, progress, status)).await
+    }
+
+    pub async fn get_file_task_status(&self, id: i64) -> Result<Option<(crate::types::TransferStatus, f64)>, AppError> {
+        self.run_blocking(move |db| db.get_file_task_status(id)).await
+    }
+
+    pub async fn save_config(&self, key: String, value: String) -> Result<(), AppError> {
+        self.run_blocking(move |db| db.save_config(&key, &value)).await
+    }
+
+    pub async fn get_config(&self, key: String) -> Result<Option<String>, AppError> {
+        self.run_blocking(move |db| db.get_config(&key)).await
+    }
+
+    pub async fn get_total_messages_count(&self) -> Result<i64, AppError> {
+        self.run_blocking(move |db| db.get_total_messages_count()).await
+    }
+
+    pub async fn get_total_file_transfers_count(&self) -> Result<i64, AppError> {
+        self.run_blocking(move |db| db.get_total_file_transfers_count()).await
+    }
+
+    pub async fn get_max_file_task_id(&self) -> Result<i64, AppError> {
+        self.run_blocking(move |db| db.get_max_file_task_id()).await
+    }
+
+    pub async fn save_active_session(&self, peer_ip: String, last_updated_at: i64) -> Result<(), AppError> {
+        self.run_blocking(move |db| db.save_active_session(&peer_ip, last_updated_at)).await
+    }
+
+    pub async fn get_active_sessions(&self) -> Result<Vec<String>, AppError> {
+        self.run_blocking(move |db| db.get_active_sessions()).await
+    }
+
+    pub async fn delete_active_session(&self, peer_ip: String) -> Result<(), AppError> {
+        self.run_blocking(move |db| db.delete_active_session(&peer_ip)).await
+    }
 }
 
 #[cfg(test)]

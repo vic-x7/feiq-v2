@@ -141,10 +141,18 @@ async fn test_full_lifecycle_multi_instance_emulation() {
 
     // Verify Bob's SQLite database successfully persistent-saved the message
     {
-        let history = bob_db
-            .get_chat_history("127.0.0.1".to_string(), 10, 0)
-            .await
-            .unwrap();
+        let mut history = Vec::new();
+        for _ in 0..10 {
+            history = bob_db
+                .get_chat_history("127.0.0.1".to_string(), 10, 0)
+                .await
+                .unwrap();
+            if history.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
         println!("Bob DB messages found ({}):", history.len());
         for (i, m) in history.iter().enumerate() {
             println!(

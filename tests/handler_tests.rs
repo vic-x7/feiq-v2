@@ -111,7 +111,7 @@ async fn test_send_message_handler() {
     let db_path = temp_dir.join(format!("test_handler_db_{}.db", unique_id));
 
     let db = DatabaseManager::new(db_path).unwrap();
-    let (db_client, _db_join_handle) = feiq_v2::database::start_db_actor(db);
+    let db_client = feiq_v2::database::DbClient::new(db);
 
     let (event_tx, _event_rx) = broadcast_channel(128);
     let dispatcher = Arc::new(BroadcastEventDispatcher::new(event_tx.clone()));
@@ -175,7 +175,7 @@ async fn test_update_identity_handler() {
     let db_path = temp_dir.join(format!("test_identity_db_{}.db", unique_id));
 
     let db = DatabaseManager::new(db_path).unwrap();
-    let (db_client, _db_join_handle) = feiq_v2::database::start_db_actor(db);
+    let db_client = feiq_v2::database::DbClient::new(db);
 
     let (event_tx, _event_rx) = broadcast_channel(128);
     let dispatcher = Arc::new(BroadcastEventDispatcher::new(event_tx.clone()));
@@ -223,7 +223,7 @@ async fn test_send_knock_handler() {
     let db_path = temp_dir.join(format!("test_knock_db_{}.db", unique_id));
 
     let db = DatabaseManager::new(db_path).unwrap();
-    let (db_client, _db_join_handle) = feiq_v2::database::start_db_actor(db);
+    let db_client = feiq_v2::database::DbClient::new(db);
 
     let (event_tx, _event_rx) = broadcast_channel(128);
     let dispatcher = Arc::new(BroadcastEventDispatcher::new(event_tx.clone()));

@@ -108,18 +108,17 @@ impl EventPersister {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::{start_db_actor, DatabaseManager};
+    use crate::database::DatabaseManager;
     use std::path::PathBuf;
 
-    async fn temp_db_client() -> (DbClient, tokio::task::JoinHandle<()>) {
+    async fn temp_db_client() -> DbClient {
         let manager = DatabaseManager::new(PathBuf::from(":memory:")).unwrap();
-        let (client, handle) = start_db_actor(manager);
-        (client, handle)
+        DbClient::new(manager)
     }
 
     #[tokio::test]
     async fn test_persist_peer_status_changed_online() {
-        let (db, _handle) = temp_db_client().await;
+        let db = temp_db_client().await;
         let persister = EventPersister::new(db.clone());
 
         let event = CoreEvent::PeerStatusChanged {
@@ -142,7 +141,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_peer_status_changed_offline() {
-        let (db, _handle) = temp_db_client().await;
+        let db = temp_db_client().await;
         let persister = EventPersister::new(db.clone());
 
         let event = CoreEvent::PeerStatusChanged {
@@ -161,7 +160,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_message_received() {
-        let (db, _handle) = temp_db_client().await;
+        let db = temp_db_client().await;
         let persister = EventPersister::new(db.clone());
 
         let event = CoreEvent::MessageReceived {
@@ -188,7 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_window_knock() {
-        let (db, _handle) = temp_db_client().await;
+        let db = temp_db_client().await;
         let persister = EventPersister::new(db.clone());
 
         let event = CoreEvent::WindowKnock {
@@ -210,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_transfer_lifecycle() {
-        let (db, _handle) = temp_db_client().await;
+        let db = temp_db_client().await;
         let persister = EventPersister::new(db.clone());
 
         // 1. Start transfer
