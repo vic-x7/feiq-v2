@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::str::FromStr;
 
 use super::{NetworkEvents, AckTracker, FileRegistry, PeerDirectory, SharedFile};
 use crate::protocol::*;
@@ -32,22 +33,26 @@ pub struct NetworkEngine {
     packet_dispatcher: Arc<super::PacketDispatcher>,
     pub(crate) event_dispatcher: Arc<dyn NetworkEvents>,
 
-    // Deep modules extracted for Candidate 1 refactor
+    // Text encoder/decoder plugin hook
+    pub transcoder: Arc<dyn TextTranscoder>,
+
+    // Deep modules
     pub ack_tracker: AckTracker,
     pub file_registry: FileRegistry,
     pub peer_directory: PeerDirectory,
 
-    // Task ID generation moved to engine (C10)
+    // Task ID generation
     pub(crate) next_task_id: std::sync::atomic::AtomicI64,
 }
 
 impl NetworkEngine {
-    /// Creates a new `NetworkEngine` instance using an injected transport.
+    /// Creates a new `NetworkEngine` instance using an injected transport and transcoder.
     pub fn new(
         username: String,
         hostname: String,
         transport: Arc<dyn NetworkTransport>,
         event_dispatcher: Arc<dyn NetworkEvents>,
+        transcoder: Arc<dyn TextTranscoder>,
         max_task_id: i64,
     ) -> Result<Self, AppError> {
         let final_port = transport
@@ -56,9 +61,6 @@ impl NetworkEngine {
             .map(|addr| addr.port())
             .unwrap_or(0);
 
-        // Offset starting packet number with final_port multiplied by 100,000 to guarantee completely disjoint
-        // packet number spaces (separated by 100k) and prevent duplicate cache collisions when multiple
-        // instances run concurrently on loopback (127.0.0.1).
         let start_packet_no = (chrono::Utc::now().timestamp() as u32)
             .wrapping_add((final_port as u32).wrapping_mul(100_000));
 
@@ -82,6 +84,7 @@ impl NetworkEngine {
             stats_errors: std::sync::atomic::AtomicU64::new(0),
             packet_dispatcher,
             event_dispatcher,
+            transcoder,
             ack_tracker: AckTracker::new(),
             file_registry: FileRegistry::new(),
             peer_directory: PeerDirectory::new(),
@@ -89,7 +92,7 @@ impl NetworkEngine {
         })
     }
 
-    /// Increments and returns the next transfer task ID (C10)
+    /// Increments and returns the next transfer task ID
     pub fn next_transfer_task_id(&self) -> i64 {
         self.next_task_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
@@ -188,7 +191,8 @@ impl NetworkEngine {
             extra: extra.to_string(),
         };
 
-        let data = packet.serialize();
+        let s = packet.serialize_to_string();
+        let data = self.transcoder.encode(&s)?;
         match self.transport.send_udp(to_ip, port, &data).await {
             Ok(()) => {
                 self.stats_packets_sent
@@ -322,33 +326,43 @@ impl NetworkEngine {
                             self.stats_bytes_received.fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
                             let raw_bytes = &buf[..size];
 
-                            // RAW PACKET DIAGNOSTICS LOGGING
-                            let (decoded, _, _) = encoding_rs::GBK.decode(raw_bytes);
-                            println!("[UDP RECV] Raw payload from {}: {}", src_addr, decoded);
+                            let decoded_res = self.transcoder.decode(raw_bytes);
+                            match decoded_res {
+                                Ok(decoded) => {
+                                    println!("[UDP RECV] Raw payload from {}: {}", src_addr, decoded);
 
-                            let ip_u32 = match src_addr.ip() {
-                                std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
-                                _ => 0,
-                            };
+                                    let ip_u32 = match src_addr.ip() {
+                                        std::net::IpAddr::V4(ipv4) => u32::from(ipv4),
+                                        _ => 0,
+                                    };
 
-                            let is_self = if let Ok(local_addr) = self.transport.local_addr() {
-                                src_addr == local_addr || (src_addr.ip() == local_addr.ip() && src_addr.port() == local_addr.port())
-                            } else {
-                                false
-                            };
+                                    let is_self = if let Ok(local_addr) = self.transport.local_addr() {
+                                        src_addr == local_addr || (src_addr.ip() == local_addr.ip() && src_addr.port() == local_addr.port())
+                                    } else {
+                                        false
+                                    };
 
-                            if !is_self && ip_u32 != 0 {
-                                self.peer_directory.upsert(ip_u32, src_addr.port());
-                            }
+                                    if !is_self && ip_u32 != 0 {
+                                        self.peer_directory.upsert(ip_u32, src_addr.port());
+                                    }
 
-                            if let Some(packet) = IPMsgPacket::parse(raw_bytes) {
-                                if let Err(e) = self.clone().handle_incoming_packet(src_addr.ip(), ip_u32, packet).await {
-                                    self.stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    eprintln!("Error handling packet: {}", e);
+                                    match IPMsgPacket::from_str(&decoded) {
+                                        Ok(packet) => {
+                                            if let Err(e) = self.clone().handle_incoming_packet(src_addr.ip(), ip_u32, packet).await {
+                                                self.stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                eprintln!("Error handling packet: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            self.stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            println!("[UDP RECV WARNING] Failed to parse packet from {} due to: {}.", src_addr, e);
+                                        }
+                                    }
                                 }
-                            } else {
-                                self.stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                println!("[UDP RECV WARNING] Failed to parse packet from {}.", src_addr);
+                                Err(e) => {
+                                    self.stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    eprintln!("Error decoding received bytes: {}", e);
+                                }
                             }
                         }
                         Err(e) => {
@@ -369,11 +383,11 @@ impl NetworkEngine {
         peer_ip: &str,
         request_payload: &[u8],
     ) -> Result<crate::network::transport::UploadRequestDetails, AppError> {
-        let parsed_packet = IPMsgPacket::parse(request_payload)
-            .ok_or_else(|| AppError::Other("Failed to parse IPMsg TCP packet".to_string()))?;
+        let decoded = self.transcoder.decode(request_payload)?;
+        let parsed_packet = IPMsgPacket::from_str(&decoded)?;
 
-        let cmd_base = parsed_packet.cmd & 0xFF;
-        if cmd_base != IPMSG_GETFILEDATA {
+        let cmd_base = parsed_packet.command_base();
+        if cmd_base != IPMSG_GETFILEDATA && cmd_base != IPMSG_GETDIRFILES {
             return Err(AppError::Other(format!("Unsupported TCP command: {}", cmd_base)));
         }
 
@@ -430,7 +444,6 @@ impl NetworkEngine {
     }
 
     pub async fn scan_subnet(self: Arc<Self>, subnet_prefix: &str, cancel: crate::types::CancellationToken) {
-        // Thread pool discovery scan across subnet IP ranges (1 to 254) with throttled batch dispatch
         let subnet = subnet_prefix.trim_end_matches('.').to_string();
         let username = self.my_username.lock().unwrap().clone();
 
@@ -450,7 +463,6 @@ impl NetworkEngine {
                     .send_packet(&ip, IPMSG_BR_ENTRY, &username_clone)
                     .await;
             });
-            // 5ms throttle delay to avoid saturating network stack
             tokio::select! {
                 _ = cancel.cancelled() => {
                     break;
@@ -490,11 +502,12 @@ impl NetworkEngine {
             packet_no: self.next_packet_no(),
             username,
             hostname,
-            cmd: IPMSG_GETFILEDATA,
+            cmd: if req.is_directory { IPMSG_GETDIRFILES } else { IPMSG_GETFILEDATA },
             extra: extra_payload,
         };
 
-        let request_data = request_packet.serialize();
+        let s = request_packet.serialize_to_string();
+        let request_data = self.transcoder.encode(&s)?;
         let save_path = req.save_path;
         let file_size = req.file_size;
         let task_id = req.task_id;
@@ -514,6 +527,7 @@ impl NetworkEngine {
                 request_data,
                 save_path,
                 file_size,
+                req.is_directory,
                 task_id,
                 progress_callback,
             )
@@ -577,10 +591,6 @@ impl super::NetworkEngineTrait for NetworkEngine {
 
     fn update_identity(&self, username: String, hostname: String) {
         self.update_identity(username, hostname)
-    }
-
-    async fn scan_subnet(self: Arc<Self>, subnet_prefix: &str, cancel: crate::types::CancellationToken) {
-        self.scan_subnet(subnet_prefix, cancel).await
     }
 
     fn next_transfer_task_id(&self) -> i64 {

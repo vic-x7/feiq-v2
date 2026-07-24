@@ -124,6 +124,7 @@ impl NetworkTransport for TokioTransport {
         request_data: Vec<u8>,
         save_path: PathBuf,
         file_size: u64,
+        is_directory: bool,
         task_id: i64,
         progress_callback: Arc<
             dyn Fn(i64, f64, crate::types::TransferStatus) + Send + Sync + 'static,
@@ -149,6 +150,12 @@ impl NetworkTransport for TokioTransport {
         if let Err(e) = stream.shutdown().await {
             progress_callback(task_id, 0.0, crate::types::TransferStatus::Failed);
             return Err(AppError::Io(e));
+        }
+
+        if is_directory {
+            download_directory_stream_tokio(&mut stream, &save_path, self.shutdown.clone()).await?;
+            progress_callback(task_id, 1.0, crate::types::TransferStatus::Completed);
+            return Ok(());
         }
 
         let file = match tokio::fs::File::create(&save_path).await {
@@ -416,6 +423,27 @@ impl TokioTransport {
         let offset = details.offset;
         let task_id = details.task_id;
 
+        // Check if the path is a directory (C1)
+        let metadata = match tokio::fs::metadata(&file_path).await {
+            Ok(m) => m,
+            Err(e) => {
+                progress_callback(task_id, 0.0, crate::types::TransferStatus::Failed);
+                return Err(AppError::Other(format!("Failed to read file/folder metadata: {}", e)));
+            }
+        };
+
+        if metadata.is_dir() {
+            let name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            stream_directory_recursive(&mut stream, &file_path, &name, shutdown).await?;
+            progress_callback(task_id, 1.0, crate::types::TransferStatus::Completed);
+            println!(
+                "[TCP SEND DIR SUCCESS] Successfully sent folder '{}' to peer {}",
+                file_path.display(),
+                peer_ip
+            );
+            return Ok(());
+        }
+
         // Open the file and seek to requested offset
         let mut file = match tokio::fs::File::open(&file_path).await {
             Ok(f) => f,
@@ -453,5 +481,175 @@ impl TokioTransport {
         );
 
         Ok(())
+    }
+}
+
+fn format_dir_header(name: &str, file_size: u64, file_attr: u32) -> Vec<u8> {
+    let name_escaped = name.replace(':', "::");
+    let body = format!("{}:{:x}:{:x}:", name_escaped, file_size, file_attr);
+    let mut header_size = body.len() + 2;
+    loop {
+        let hex_size = format!("{:x}", header_size);
+        if hex_size.len() + 1 + body.len() == header_size {
+            return format!("{}:{}", hex_size, body).into_bytes();
+        }
+        header_size = hex_size.len() + 1 + body.len();
+    }
+}
+
+async fn stream_directory_recursive<W>(
+    writer: &mut W,
+    dir_path: &std::path::Path,
+    dir_name: &str,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), AppError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(AppError::Other("Shutdown initiated during directory stream".to_string()));
+    }
+
+    // 1. Write the directory start header
+    let header = format_dir_header(dir_name, 0, crate::protocol::IPMSG_FILE_DIR);
+    writer.write_all(&header).await?;
+
+    // 2. Read directory contents
+    let mut entries = tokio::fs::read_dir(dir_path).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AppError::Other("Shutdown initiated during directory stream".to_string()));
+        }
+
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let file_type = entry.file_type().await?;
+
+        if file_type.is_dir() {
+            // Recurse into subdirectory
+            Box::pin(stream_directory_recursive(writer, &path, &name, shutdown.clone())).await?;
+        } else if file_type.is_file() {
+            // Write regular file entry
+            let metadata = entry.metadata().await?;
+            let file_size = metadata.len();
+            let header = format_dir_header(&name, file_size, crate::protocol::IPMSG_FILE_REGULAR);
+            writer.write_all(&header).await?;
+
+            // Open and write file contents
+            let mut file = tokio::fs::File::open(&path).await?;
+            tokio::io::copy(&mut file, writer).await?;
+        }
+    }
+
+    // 3. Write directory end header (RETPARENT)
+    let end_header = format_dir_header(".", 0, crate::protocol::IPMSG_FILE_RETPARENT);
+    writer.write_all(&end_header).await?;
+
+    Ok(())
+}
+
+async fn download_directory_stream_tokio<R>(
+    reader: &mut R,
+    base_save_path: &std::path::Path,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), AppError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    
+    // Stack of active directory paths during recursion
+    let mut dir_stack: Vec<std::path::PathBuf> = vec![base_save_path.to_path_buf()];
+
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AppError::Other("Shutdown initiated during directory download".to_string()));
+        }
+
+        // 1. Read the header size string until ':'
+        let mut hex_size_bytes = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = reader.read(&mut byte).await?;
+            if n == 0 {
+                if dir_stack.is_empty() || dir_stack.len() == 1 {
+                    return Ok(());
+                }
+                return Err(AppError::Other("Unexpected EOF in directory download stream".to_string()));
+            }
+            if byte[0] == b':' {
+                break;
+            }
+            hex_size_bytes.push(byte[0]);
+        }
+
+        let hex_size_str = String::from_utf8(hex_size_bytes)
+            .map_err(|e| AppError::Other(format!("Invalid non-UTF-8 header size: {}", e)))?;
+        
+        let header_size = usize::from_str_radix(&hex_size_str, 16)
+            .map_err(|e| AppError::Other(format!("Failed to parse header size hex '{}': {}", hex_size_str, e)))?;
+
+        // 2. Read the remainder of the header: H - (hex_size_str.len() + 1)
+        let body_len = header_size - (hex_size_str.len() + 1);
+        let mut body_bytes = vec![0u8; body_len];
+        reader.read_exact(&mut body_bytes).await?;
+
+        let body_str = String::from_utf8(body_bytes)
+            .map_err(|e| AppError::Other(format!("Invalid non-UTF-8 header body: {}", e)))?;
+
+        // The body format is: "filename:file_size_hex:file_attr_hex:"
+        let trimmed_body = body_str.trim_end_matches(':');
+        let parts: Vec<&str> = trimmed_body.rsplitn(3, ':').collect();
+        if parts.len() != 3 {
+            return Err(AppError::Other(format!("Malformed directory entry header body: {}", body_str)));
+        }
+
+        let file_attr = u32::from_str_radix(parts[0], 16)
+            .map_err(|e| AppError::Other(format!("Invalid file_attr hex: {}", e)))?;
+        let file_size = u64::from_str_radix(parts[1], 16)
+            .map_err(|e| AppError::Other(format!("Invalid file_size hex: {}", e)))?;
+        let filename = parts[2].replace("::", ":");
+
+        // 3. Process the entry based on its attribute
+        match file_attr {
+            crate::protocol::IPMSG_FILE_DIR => {
+                let target_dir = if dir_stack.len() == 1 && dir_stack[0].ends_with(&filename) {
+                    dir_stack[0].clone()
+                } else {
+                    dir_stack.last().unwrap().join(&filename)
+                };
+
+                tokio::fs::create_dir_all(&target_dir).await?;
+                dir_stack.push(target_dir);
+            }
+            crate::protocol::IPMSG_FILE_REGULAR => {
+                let target_file = dir_stack.last().ok_or_else(|| AppError::Other("File entry without active directory context".to_string()))?.join(&filename);
+                
+                if let Some(parent) = target_file.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+
+                let mut file = tokio::fs::File::create(&target_file).await?;
+                
+                let mut bytes_to_copy = file_size;
+                let mut buf = [0u8; 65536];
+                while bytes_to_copy > 0 {
+                    let chunk_size = std::cmp::min(bytes_to_copy, buf.len() as u64) as usize;
+                    reader.read_exact(&mut buf[..chunk_size]).await?;
+                    file.write_all(&buf[..chunk_size]).await?;
+                    bytes_to_copy -= chunk_size as u64;
+                }
+            }
+            crate::protocol::IPMSG_FILE_RETPARENT => {
+                if dir_stack.len() > 1 {
+                    dir_stack.pop();
+                } else {
+                    return Ok(());
+                }
+            }
+            _ => {
+                return Err(AppError::Other(format!("Unknown directory stream file_attr: {}", file_attr)));
+            }
+        }
     }
 }

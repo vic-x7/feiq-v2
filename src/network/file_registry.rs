@@ -21,7 +21,6 @@ impl FileRegistry {
     }
 
     /// Registers a shared file under multiple keys to support various IPMsg lookups.
-    /// Eliminates the Data Clump smell by accepting a cohesive `SharedFile` object.
     pub fn register(&self, packet_no: u32, file_id: u32, file: SharedFile) {
         let mut files = self.files.lock().unwrap();
         // Store under compound keys to support both hex/dec and with/without packet_no lookups
@@ -32,7 +31,6 @@ impl FileRegistry {
     }
 
     /// Looks up a file in the registry given packet_no and file_id, supporting standard/hex formats.
-    /// Eliminates the Mysterious Name smell by consistently utilizing `packet_no` instead of `packet_id`.
     pub fn lookup(&self, packet_no: u32, file_id: u32) -> Option<SharedFile> {
         let files = self.files.lock().unwrap();
         let packet_no_hex = format!("{:x}", packet_no);
@@ -49,5 +47,11 @@ impl FileRegistry {
             .or_else(|| files.get(&key3))
             .or_else(|| files.get(&key4))
             .cloned()
+    }
+}
+
+impl Default for FileRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }

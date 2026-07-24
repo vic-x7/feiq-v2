@@ -91,6 +91,7 @@ impl NetworkTransport for FakeTransport {
         _request_data: Vec<u8>,
         _save_path: PathBuf,
         _file_size: u64,
+        _is_directory: bool,
         _task_id: i64,
         _progress_callback: Arc<
             dyn Fn(i64, f64, crate::types::TransferStatus) + Send + Sync + 'static,

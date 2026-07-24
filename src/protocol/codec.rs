@@ -1,6 +1,9 @@
-use encoding_rs::GBK;
+use crate::error::ProtocolError;
+use crate::types::FileAttachment;
+use std::str::FromStr;
+use super::command::{IPMSG_FILEATTACHOPT, IPMSG_SENDCHECKOPT};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IPMsgPacket {
     pub version: String,
     pub packet_no: u32,
@@ -9,8 +12,6 @@ pub struct IPMsgPacket {
     pub cmd: u32,
     pub extra: String,
 }
-
-pub use crate::types::FileAttachment;
 
 pub fn serialize_file_attachment(att: &FileAttachment) -> String {
     let name_escaped = att.name.replace(':', "::");
@@ -70,33 +71,32 @@ pub fn parse_file_attachments(extra_part: &str) -> Vec<FileAttachment> {
     attachments
 }
 
-impl IPMsgPacket {
-    pub fn parse(raw_bytes: &[u8]) -> Option<Self> {
-        // Transcode GBK bytes to UTF-8
-        let (decoded, _, has_errors) = GBK.decode(raw_bytes);
-        if has_errors {
-            // Log or handle decode warning
-        }
+impl FromStr for IPMsgPacket {
+    type Err = ProtocolError;
 
-        let s = decoded.into_owned();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         let trimmed = s.trim_end_matches('\0');
         let parts: Vec<&str> = trimmed.splitn(6, ':').collect();
         if parts.len() < 5 {
-            return None;
+            return Err(ProtocolError::TooFewFields(parts.len()));
         }
 
         let version = parts[0].to_string();
-        let packet_no = parts[1].parse::<u32>().unwrap_or(0);
+        let packet_no = parts[1]
+            .parse::<u32>()
+            .map_err(|_| ProtocolError::InvalidPacketNo(parts[1].to_string()))?;
         let username = parts[2].to_string();
         let hostname = parts[3].to_string();
-        let cmd = parts[4].parse::<u32>().unwrap_or(0);
+        let cmd = parts[4]
+            .parse::<u32>()
+            .map_err(|_| ProtocolError::InvalidCommand(parts[4].to_string()))?;
         let extra = if parts.len() > 5 {
             parts[5].to_string()
         } else {
             String::new()
         };
 
-        Some(IPMsgPacket {
+        Ok(IPMsgPacket {
             version,
             packet_no,
             username,
@@ -105,29 +105,41 @@ impl IPMsgPacket {
             extra,
         })
     }
+}
 
-    pub fn serialize(&self) -> Vec<u8> {
+impl IPMsgPacket {
+    pub fn serialize_to_string(&self) -> String {
         // High-Performance Optimization: Pre-allocate String heap capacity to avoid resize allocations!
         let capacity = 64 + self.username.len() + self.hostname.len() + self.extra.len();
-        let mut serialized_str = String::with_capacity(capacity);
+        let mut s = String::with_capacity(capacity);
 
         use std::fmt::Write;
         let _ = write!(
-            &mut serialized_str,
+            &mut s,
             "{}:{}:{}:{}:{}:{}\0",
             self.version, self.packet_no, self.username, self.hostname, self.cmd, self.extra
         );
-
-        let (encoded_bytes, _, _) = GBK.encode(&serialized_str);
-        encoded_bytes.into_owned()
+        s
     }
-}
 
-pub fn format_file_size(bytes: u64) -> String {
-    if bytes > 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
+    /// Gets the base core command (filtering out all high-bit option flags).
+    pub fn command_base(&self) -> u32 {
+        self.cmd & 0x000000FF
+    }
+
+    /// Checks if the command contains a specific option flag.
+    pub fn has_option(&self, option_flag: u32) -> bool {
+        (self.cmd & option_flag) == option_flag
+    }
+
+    /// Convenience method to check if the command has the file attachment option.
+    pub fn is_file_attach(&self) -> bool {
+        self.has_option(IPMSG_FILEATTACHOPT)
+    }
+
+    /// Convenience method to check if the command needs an acknowledgement reply.
+    pub fn is_send_check(&self) -> bool {
+        self.has_option(IPMSG_SENDCHECKOPT)
     }
 }
 
@@ -146,8 +158,8 @@ mod tests {
             extra: "hello".to_string(),
         };
 
-        let bytes = pkt.serialize();
-        let parsed = IPMsgPacket::parse(&bytes).unwrap();
+        let s = pkt.serialize_to_string();
+        let parsed = IPMsgPacket::from_str(&s).unwrap();
 
         assert_eq!(parsed.version, "1");
         assert_eq!(parsed.packet_no, 12345);
@@ -158,37 +170,20 @@ mod tests {
     }
 
     #[test]
-    fn test_ipmsg_packet_gbk_chinese() {
-        let pkt = IPMsgPacket {
-            version: "1_lbt6".to_string(),
-            packet_no: 999,
-            username: "飞秋用户".to_string(),
-            hostname: "主机".to_string(),
-            cmd: 32,
-            extra: "你好，飞秋！".to_string(),
-        };
-
-        let bytes = pkt.serialize();
-        let parsed = IPMsgPacket::parse(&bytes).unwrap();
-
-        assert_eq!(parsed.username, "飞秋用户");
-        assert_eq!(parsed.hostname, "主机");
-        assert_eq!(parsed.extra, "你好，飞秋！");
-    }
-
-    #[test]
     fn test_ipmsg_packet_malformed() {
         // Test malformed packet with fewer than 5 fields
-        let malformed_short = b"1:12345:bob:bob-pc";
-        let parsed_short = IPMsgPacket::parse(malformed_short);
-        assert!(parsed_short.is_none());
+        let malformed_short = "1:12345:bob:bob-pc";
+        let parsed_short = IPMsgPacket::from_str(malformed_short);
+        assert!(matches!(parsed_short, Err(ProtocolError::TooFewFields(_))));
 
-        // Test non-numeric packet_no and command (should fall back to 0 gracefully without panicking)
-        let malformed_non_numeric = b"1:invalid_no:bob:bob-pc:invalid_cmd:hello";
-        let parsed_non_numeric = IPMsgPacket::parse(malformed_non_numeric).unwrap();
-        assert_eq!(parsed_non_numeric.packet_no, 0);
-        assert_eq!(parsed_non_numeric.cmd, 0);
-        assert_eq!(parsed_non_numeric.extra, "hello");
+        // Test non-numeric packet_no and command (should return correct ProtocolErrors)
+        let malformed_non_numeric_no = "1:invalid_no:bob:bob-pc:32:hello";
+        let parsed_non_numeric_no = IPMsgPacket::from_str(malformed_non_numeric_no);
+        assert!(matches!(parsed_non_numeric_no, Err(ProtocolError::InvalidPacketNo(_))));
+
+        let malformed_non_numeric_cmd = "1:12345:bob:bob-pc:invalid_cmd:hello";
+        let parsed_non_numeric_cmd = IPMsgPacket::from_str(malformed_non_numeric_cmd);
+        assert!(matches!(parsed_non_numeric_cmd, Err(ProtocolError::InvalidCommand(_))));
     }
 
     #[test]
@@ -231,9 +226,18 @@ mod tests {
     }
 
     #[test]
-    fn test_format_file_size() {
-        assert_eq!(format_file_size(512), "0.5 KB");
-        assert_eq!(format_file_size(1024), "1.0 KB");
-        assert_eq!(format_file_size(1024 * 1024 + 1), "1.0 MB");
+    fn test_packet_cmd_helpers() {
+        let pkt = IPMsgPacket {
+            version: "1".to_string(),
+            packet_no: 12345,
+            username: "bob".to_string(),
+            hostname: "bob-pc".to_string(),
+            cmd: 0x00200120, // IPMSG_SENDMSG (0x20) | IPMSG_FILEATTACHOPT (0x00200000) | IPMSG_SENDCHECKOPT (0x00000100)
+            extra: "".to_string(),
+        };
+
+        assert_eq!(pkt.command_base(), 0x20);
+        assert!(pkt.is_file_attach());
+        assert!(pkt.is_send_check());
     }
 }

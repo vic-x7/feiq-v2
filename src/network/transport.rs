@@ -23,6 +23,7 @@ pub trait NetworkTransport: Send + Sync {
         request_data: Vec<u8>,
         save_path: PathBuf,
         file_size: u64,
+        is_directory: bool,
         task_id: i64,
         progress_callback: Arc<
             dyn Fn(i64, f64, crate::types::TransferStatus) + Send + Sync + 'static,

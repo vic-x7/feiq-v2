@@ -17,7 +17,7 @@ pub use ack_tracker::AckTracker;
 pub use file_registry::{FileRegistry, SharedFile};
 pub use peer_directory::PeerDirectory;
 
-use crate::types::FileDownloadRequest;
+use crate::types::{FileDownloadRequest, FileAttachment};
 use crate::error::AppError;
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -45,7 +45,6 @@ pub trait NetworkEngineTrait: Send + Sync + 'static {
     );
     async fn download_file_direct(&self, req: FileDownloadRequest) -> Result<(), AppError>;
     fn update_identity(&self, username: String, hostname: String);
-    async fn scan_subnet(self: Arc<Self>, subnet_prefix: &str, cancel: crate::types::CancellationToken);
     fn next_transfer_task_id(&self) -> i64;
 }
 
@@ -69,7 +68,7 @@ pub trait NetworkEvents: Send + Sync + 'static {
         &self,
         sender_ip: String,
         packet_no: u32,
-        files: Vec<crate::protocol::FileAttachment>,
+        files: Vec<FileAttachment>,
     );
     fn on_window_knock(&self, sender_ip: String, username: String);
     fn on_peer_typing(&self, sender_ip: String, typing: bool);

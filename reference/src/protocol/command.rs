@@ -1,0 +1,19 @@
+pub const IPMSG_PORT: u16 = 2425;
+pub const IPMSG_VERSION: &str = "1_lbt6_0#128#C025A5C497AA#0#0#0#4001#9";
+
+// Core IPMsg Command constants
+pub const IPMSG_NOOPERATION: u32 = 0x00000000;
+pub const IPMSG_BR_ENTRY: u32 = 0x00000001;
+pub const IPMSG_BR_EXIT: u32 = 0x00000002;
+pub const IPMSG_ANSENTRY: u32 = 0x00000003;
+pub const IPMSG_SENDMSG: u32 = 0x00000020;
+pub const IPMSG_RECVMSG: u32 = 0x00000021;
+pub const IPMSG_INPUTING: u32 = 0x00000079;
+pub const IPMSG_INPUT_END: u32 = 0x0000007a;
+pub const IPMSG_KNOCK: u32 = 0x000000d1;
+pub const IPMSG_GETFILEDATA: u32 = 0x00000060;
+
+// Core Option Flags
+pub const IPMSG_SENDCHECKOPT: u32 = 0x00000100;
+pub const IPMSG_FILEATTACHOPT: u32 = 0x00200000;
+pub const IPMSG_FILE_CLIPBOARD: u32 = 0x00000020;

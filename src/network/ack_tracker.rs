@@ -39,8 +39,6 @@ impl AckTracker {
     }
 
     /// Retries sending a packet with ACK and timeout, handling the oneshot lifecycle cleanly.
-    /// Addresses C14: old sender is explicitly removed from pending_acks before re-inserting,
-    /// avoiding channel overwrite or dangling sender issues.
     pub async fn send_with_ack<F, Fut>(&self, packet_no: u32, send_fn: F) -> Result<(), AppError>
     where
         F: Fn() -> Fut + Send + Sync,
@@ -57,8 +55,6 @@ impl AckTracker {
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
                 // Retry once:
-                // C14: Ensure the old sender is explicitly removed from pending_acks before re-inserting,
-                // avoiding any nanosecond-scale channel overwrite or dangling sender issues.
                 self.remove(packet_no).await;
 
                 let (tx_retry, rx_retry) = tokio::sync::oneshot::channel();
@@ -77,5 +73,11 @@ impl AckTracker {
                 }
             }
         }
+    }
+}
+
+impl Default for AckTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }

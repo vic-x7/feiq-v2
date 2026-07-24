@@ -46,3 +46,9 @@ impl PeerDirectory {
         self.get_port(ip_u32)
     }
 }
+
+impl Default for PeerDirectory {
+    fn default() -> Self {
+        Self::new()
+    }
+}

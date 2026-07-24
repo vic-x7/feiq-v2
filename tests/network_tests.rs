@@ -1,6 +1,6 @@
-use feiq_v2::database::DatabaseManager;
 use feiq_v2::network::{NetworkEngine, NetworkEvents};
 use feiq_v2::types::{FileDownloadRequest, CancellationToken};
+use feiq_v2::protocol::Utf8Transcoder;
 use std::sync::Arc;
 
 struct MockEvents;
@@ -29,7 +29,7 @@ impl NetworkEvents for MockEvents {
         &self,
         _sender_ip: String,
         _packet_no: u32,
-        _files: Vec<feiq_v2::protocol::FileAttachment>,
+        _files: Vec<feiq_v2::types::FileAttachment>,
     ) {
     }
 
@@ -55,10 +55,13 @@ impl NetworkEvents for MockEvents {
     ) {
     }
 }
+
 #[tokio::test]
 async fn test_network_engine_binding_and_fallback() {
     let dispatcher1 = Arc::new(MockEvents);
     let dispatcher2 = Arc::new(MockEvents);
+    let transcoder1 = Arc::new(Utf8Transcoder);
+    let transcoder2 = Arc::new(Utf8Transcoder);
 
     // 1. Create first network engine on loopback
     let transport1 = Arc::new(
@@ -71,6 +74,7 @@ async fn test_network_engine_binding_and_fallback() {
         "alice-pc".to_string(),
         transport1,
         dispatcher1,
+        transcoder1,
         0,
     );
 
@@ -93,6 +97,7 @@ async fn test_network_engine_binding_and_fallback() {
         "bob-pc".to_string(),
         transport2,
         dispatcher2,
+        transcoder2,
         0,
     );
 
@@ -134,14 +139,8 @@ async fn test_network_file_transfer_loopback() {
 
     let dispatcher_bob = Arc::new(MockEvents);
     let dispatcher_alice = Arc::new(MockEvents);
-
-    // Initialize databases
-    let _db_bob = Arc::new(std::sync::Mutex::new(
-        DatabaseManager::new(":memory:".into()).unwrap(),
-    ));
-    let db_alice = Arc::new(std::sync::Mutex::new(
-        DatabaseManager::new(":memory:".into()).unwrap(),
-    ));
+    let transcoder_bob = Arc::new(Utf8Transcoder);
+    let transcoder_alice = Arc::new(Utf8Transcoder);
 
     // Create engines
     let transport_bob = Arc::new(
@@ -155,6 +154,7 @@ async fn test_network_file_transfer_loopback() {
             "bob-pc".to_string(),
             transport_bob,
             dispatcher_bob,
+            transcoder_bob,
             0,
         )
         .unwrap(),
@@ -171,6 +171,7 @@ async fn test_network_file_transfer_loopback() {
             "alice-pc".to_string(),
             transport_alice,
             dispatcher_alice,
+            transcoder_alice,
             0,
         )
         .unwrap(),
@@ -210,23 +211,6 @@ async fn test_network_file_transfer_loopback() {
         test_content.len() as u64,
     );
 
-    // Create FileTask record on Alice's (receiver) side
-    let task_record = feiq_v2::database::FileTaskRecord {
-        id: None,
-        file_name: "downloaded.txt".to_string(),
-        file_size: test_content.len() as i64,
-        peer_ip: "127.0.0.1".to_string(),
-        is_sending: false,
-        status: feiq_v2::types::TransferStatus::Pending,
-        progress: 0.0,
-        timestamp: 1234567,
-    };
-    let task_id = db_alice
-        .lock()
-        .unwrap()
-        .create_file_task(&task_record)
-        .unwrap();
-
     // Alice requests download direct from Bob
     let req = FileDownloadRequest {
         peer_ip: "127.0.0.1".to_string(),
@@ -234,7 +218,8 @@ async fn test_network_file_transfer_loopback() {
         file_id,
         save_path: dest_path.clone(),
         file_size: test_content.len() as u64,
-        task_id,
+        is_directory: false,
+        task_id: 1, // Static task ID for testing without database
     };
 
     let download_result = alice.download_file_direct(req).await;
@@ -247,14 +232,6 @@ async fn test_network_file_transfer_loopback() {
     // Verify downloaded content matches source exactly
     let downloaded_data = std::fs::read_to_string(&dest_path).unwrap();
     assert_eq!(downloaded_data, test_content);
-
-    // Verify Alice's SQLite task transitions to completed (progress = 1.0)
-    {
-        let db_lock = db_alice.lock().unwrap();
-        // Check database is updated correctly
-        let count = db_lock.get_total_file_transfers_count().unwrap();
-        assert_eq!(count, 1);
-    }
 
     // Verify Observability counters incremented correctly on Alice
     let alice_stats = alice.stats();
@@ -282,6 +259,150 @@ async fn test_network_file_transfer_loopback() {
     // Clean up temporary files on disk
     let _ = std::fs::remove_file(&source_path);
     let _ = std::fs::remove_file(&dest_path);
+}
+
+#[tokio::test]
+async fn test_network_directory_transfer_loopback() {
+    use std::io::Write;
+
+    let temp_dir = std::env::temp_dir();
+    let unique_id = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    
+    // Create local folder structure:
+    // temp_dir/src_dir_unique/
+    // ├── file1.txt ("hello")
+    // └── sub_dir/
+    //     └── file2.txt ("subfile content")
+    let src_dir = temp_dir.join(format!("src_dir_{}", unique_id));
+    let sub_dir = src_dir.join("sub_dir");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+
+    let file1_path = src_dir.join("file1.txt");
+    {
+        let mut file = std::fs::File::create(&file1_path).unwrap();
+        file.write_all(b"hello").unwrap();
+    }
+
+    let file2_path = sub_dir.join("file2.txt");
+    {
+        let mut file = std::fs::File::create(&file2_path).unwrap();
+        file.write_all(b"subfile content").unwrap();
+    }
+
+    let dest_dir = temp_dir.join(format!("dest_dir_{}", unique_id));
+
+    let dispatcher_bob = Arc::new(MockEvents);
+    let dispatcher_alice = Arc::new(MockEvents);
+    let transcoder_bob = Arc::new(Utf8Transcoder);
+    let transcoder_alice = Arc::new(Utf8Transcoder);
+
+    // Create engines
+    let transport_bob = Arc::new(
+        feiq_v2::network::TokioTransport::bind_fallback("127.0.0.1", 2425)
+            .await
+            .unwrap(),
+    );
+    let bob = Arc::new(
+        NetworkEngine::new(
+            "bob".to_string(),
+            "bob-pc".to_string(),
+            transport_bob,
+            dispatcher_bob,
+            transcoder_bob,
+            0,
+        )
+        .unwrap(),
+    );
+
+    let transport_alice = Arc::new(
+        feiq_v2::network::TokioTransport::bind_fallback("127.0.0.1", 2425)
+            .await
+            .unwrap(),
+    );
+    let alice = Arc::new(
+        NetworkEngine::new(
+            "alice".to_string(),
+            "alice-pc".to_string(),
+            transport_alice,
+            dispatcher_alice,
+            transcoder_alice,
+            0,
+        )
+        .unwrap(),
+    );
+
+    let bob_port = bob.socket_local_addr().unwrap().port();
+    let alice_port = alice.socket_local_addr().unwrap().port();
+
+    alice.register_peer_port("127.0.0.1", bob_port);
+    bob.register_peer_port("127.0.0.1", alice_port);
+
+    // Spawn receive loops
+    let bob_clone = bob.clone();
+    let cancel_bob = CancellationToken::new();
+    let cancel_bob_clone = cancel_bob.clone();
+    let handle_bob = tokio::spawn(async move {
+        bob_clone.start_receive_loop(cancel_bob_clone).await;
+    });
+
+    let alice_clone = alice.clone();
+    let cancel_alice = CancellationToken::new();
+    let cancel_alice_clone = cancel_alice.clone();
+    let handle_alice = tokio::spawn(async move {
+        alice_clone.start_receive_loop(cancel_alice_clone).await;
+    });
+
+    // Bob registers the shared directory
+    let packet_no = 99u32;
+    let file_id = 1u32;
+    bob.register_shared_file(
+        packet_no,
+        file_id,
+        src_dir.clone(),
+        format!("src_dir_{}", unique_id),
+        0, // Size is typically 0 for directories
+    );
+
+    // Alice requests directory download direct from Bob
+    let req = FileDownloadRequest {
+        peer_ip: "127.0.0.1".to_string(),
+        packet_no,
+        file_id,
+        save_path: dest_dir.clone(),
+        file_size: 0,
+        is_directory: true, // This is a directory download!
+        task_id: 2,
+    };
+
+    let download_result = alice.download_file_direct(req).await;
+    assert!(
+        download_result.is_ok(),
+        "Directory download failed: {:?}",
+        download_result.err()
+    );
+
+    // Verify downloaded folder contents
+    let folder_name = format!("src_dir_{}", unique_id);
+    let downloaded_file1 = dest_dir.join(&folder_name).join("file1.txt");
+    let downloaded_file2 = dest_dir.join(&folder_name).join("sub_dir").join("file2.txt");
+
+    assert_eq!(std::fs::read_to_string(&downloaded_file1).unwrap(), "hello");
+    assert_eq!(std::fs::read_to_string(&downloaded_file2).unwrap(), "subfile content");
+
+    // Teardown
+    cancel_bob.cancel();
+    cancel_alice.cancel();
+    bob.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    alice.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let _ = bob.send_packet_on_port("127.0.0.1", bob_port, 0, "").await;
+    let _ = alice.send_packet_on_port("127.0.0.1", alice_port, 0, "").await;
+
+    let _ = tokio::join!(handle_bob, handle_alice);
+
+    // Clean up disk
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&dest_dir);
 }
 
 #[tokio::test]
@@ -315,6 +436,7 @@ async fn test_tokio_transport_udp_sending_and_parsing() {
 #[tokio::test]
 async fn test_fake_transport_injection_and_behavior() {
     use feiq_v2::network::{FakeTransport, NetworkEngine, NetworkEvents};
+    use std::str::FromStr;
     use std::sync::Mutex;
 
     struct DummyEvents {
@@ -347,7 +469,7 @@ async fn test_fake_transport_injection_and_behavior() {
             &self,
             _sender_ip: String,
             _packet_no: u32,
-            _files: Vec<feiq_v2::protocol::FileAttachment>,
+            _files: Vec<feiq_v2::types::FileAttachment>,
         ) {
         }
         fn on_window_knock(&self, _sender_ip: String, _username: String) {}
@@ -375,6 +497,7 @@ async fn test_fake_transport_injection_and_behavior() {
     let dispatcher = Arc::new(DummyEvents {
         status_updates: Mutex::new(Vec::new()),
     });
+    let transcoder = Arc::new(Utf8Transcoder);
 
     let engine = Arc::new(
         NetworkEngine::new(
@@ -382,6 +505,7 @@ async fn test_fake_transport_injection_and_behavior() {
             "alice-pc".to_string(),
             transport.clone(),
             dispatcher.clone(),
+            transcoder,
             0,
         )
         .unwrap(),
@@ -392,7 +516,7 @@ async fn test_fake_transport_injection_and_behavior() {
 
     // 2. Verify sending a packet captures it in the FakeTransport
     let packet_no = engine
-        .send_packet("192.168.1.100", 2425, "Hello")
+        .send_packet("192.168.1.100", 32, "Hello")
         .await
         .unwrap();
     assert!(packet_no > 0);
@@ -404,12 +528,12 @@ async fn test_fake_transport_injection_and_behavior() {
 
     // 3. Simulating receiving a packet
     // Let's inject a classic IPMsg packet bytes representing bob logging in
-    let raw_packet = b"1:12345:bob:bob-pc:1:Bob"; // IPMSG_BR_ENTRY (1)
+    let raw_packet = "1:12345:bob:bob-pc:1:Bob"; // IPMSG_BR_ENTRY (1)
     let peer_addr = "192.168.1.200:2425".parse().unwrap();
-    transport.inject_incoming(raw_packet.to_vec(), peer_addr);
+    transport.inject_incoming(raw_packet.as_bytes().to_vec(), peer_addr);
 
     // Let's spawn a quick test task or directly dispatch
-    let packet = feiq_v2::protocol::IPMsgPacket::parse(raw_packet).unwrap();
+    let packet = feiq_v2::protocol::IPMsgPacket::from_str(raw_packet).unwrap();
     engine
         .handle_incoming_packet(peer_addr.ip(), 0xC0A801C8, packet)
         .await

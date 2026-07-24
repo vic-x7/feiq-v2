@@ -1,11 +1,10 @@
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
 pub const LOCAL_USER_IDENTIFIER: &str = "me";
-pub const NUDGE_MESSAGE_CONTENT: &str = "* 发送了一个窗口抖动 *";
+pub const NUDGE_MESSAGE_CONTENT: &str = "* sent a window nudge *";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferStatus {
     Pending,
     Transferring,
@@ -13,7 +12,7 @@ pub enum TransferStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileAttachment {
     pub id: u32,
     pub name: String,
@@ -56,83 +55,8 @@ pub struct FileDownloadRequest {
     pub file_id: u32,
     pub save_path: PathBuf,
     pub file_size: u64,
+    pub is_directory: bool,
     pub task_id: i64,
-}
-
-#[derive(Debug, Clone)]
-pub enum CoreCommand {
-    SendMessage {
-        to_ip: String,
-        content: String,
-    },
-    BroadcastPresence,
-    RegisterSharedFile {
-        path: PathBuf,
-    },
-    DownloadFile {
-        peer_ip: String,
-        packet_no: u32,
-        file_id: u32,
-        name: String,
-        size: u64,
-    },
-    UpdateIdentity {
-        username: String,
-        hostname: String,
-    },
-    ScanSubnet {
-        subnet: String,
-    },
-    ShareFile {
-        peer_ip: String,
-        path: PathBuf,
-    },
-    SendKnock {
-        peer_ip: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub enum CoreEvent {
-    PeerStatusChanged {
-        ip: String,
-        username: String,
-        hostname: String,
-        nickname: Option<String>,
-        online: bool,
-    },
-    MessageReceived {
-        id: i64,
-        sender_ip: String,
-        content: String,
-        timestamp: i64,
-        username: String,
-    },
-    FileAttachmentsReceived {
-        sender_ip: String,
-        packet_no: u32,
-        files: Vec<FileAttachment>,
-    },
-    WindowKnock {
-        sender_ip: String,
-        username: String,
-    },
-    PeerTyping {
-        sender_ip: String,
-        typing: bool,
-    },
-    TransferProgress {
-        task_id: i64,
-        progress: f64,
-        status: TransferStatus,
-    },
-    TransferStarted {
-        task_id: i64,
-        peer_ip: String,
-        file_name: String,
-        file_size: i64,
-        is_sending: bool,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +101,14 @@ impl Default for CancellationToken {
     }
 }
 
+pub fn format_file_size(bytes: u64) -> String {
+    if bytes > 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +127,12 @@ mod tests {
 
         // Test awaiting cancelled
         cancel_clone.cancelled().await; // should return immediately
+    }
+
+    #[test]
+    fn test_format_file_size() {
+        assert_eq!(format_file_size(512), "0.5 KB");
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1024 * 1024 + 1), "1.0 MB");
     }
 }

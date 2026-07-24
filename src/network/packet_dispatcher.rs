@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use crate::error::AppError;
 use super::{NetworkEngine, PacketContext, PacketHandler};
+use crate::types::FileAttachment;
 use crate::protocol::{
     parse_file_attachments, IPMsgPacket, IPMSG_ANSENTRY, IPMSG_BR_ENTRY, IPMSG_BR_EXIT,
-    IPMSG_FILEATTACHOPT, IPMSG_FILE_CLIPBOARD, IPMSG_INPUTING, IPMSG_INPUT_END, IPMSG_KNOCK,
-    IPMSG_RECVMSG, IPMSG_SENDCHECKOPT, IPMSG_SENDMSG,
+    IPMSG_FILE_CLIPBOARD, IPMSG_INPUTING, IPMSG_INPUT_END, IPMSG_KNOCK,
+    IPMSG_RECVMSG, IPMSG_SENDMSG,
 };
 
 pub struct BrEntryHandler;
@@ -20,7 +21,7 @@ pub struct InputHandler;
 #[async_trait]
 impl PacketHandler for BrEntryHandler {
     async fn handle(&self, ctx: &PacketContext, packet: &IPMsgPacket) -> Result<(), AppError> {
-        let cmd_base = packet.cmd & 0xFF;
+        let cmd_base = packet.command_base();
         if cmd_base == IPMSG_BR_ENTRY {
             let my_username = ctx.engine.my_username.lock().unwrap().clone();
             let _ = ctx
@@ -35,7 +36,7 @@ impl PacketHandler for BrEntryHandler {
 /// Extracts Null-separated attachments and trims custom font styling from messages.
 fn parse_and_format_message(
     packet: &IPMsgPacket,
-) -> (String, Vec<crate::protocol::FileAttachment>) {
+) -> (String, Vec<FileAttachment>) {
     let mut text_content = packet.extra.clone();
     let mut attachments = Vec::new();
 
@@ -57,9 +58,9 @@ fn parse_and_format_message(
         att.name = super::validation::sanitize_filename(&att.name);
     }
 
-    if (packet.cmd & IPMSG_FILEATTACHOPT) == IPMSG_FILEATTACHOPT && !attachments.is_empty() {
+    if packet.is_file_attach() && !attachments.is_empty() {
         for att in &attachments {
-            let size_str = crate::protocol::format_file_size(att.size);
+            let size_str = crate::types::format_file_size(att.size);
             let file_line = format!("Shared a file: {} ({})", att.name, size_str);
             if text_content.is_empty() {
                 text_content = file_line;
@@ -76,7 +77,7 @@ fn parse_and_format_message(
 fn auto_download_clipboards(
     ctx: &PacketContext,
     packet_no: u32,
-    attachments: &[crate::protocol::FileAttachment],
+    attachments: &[FileAttachment],
 ) {
     for att in attachments {
         if (att.file_type & IPMSG_FILE_CLIPBOARD) == IPMSG_FILE_CLIPBOARD {
@@ -103,6 +104,7 @@ fn auto_download_clipboards(
                 file_id: att.id,
                 file_size: att.size,
                 save_path,
+                is_directory: false,
                 task_id,
             };
 
@@ -129,7 +131,7 @@ impl PacketHandler for SendMsgHandler {
             packet.username.clone(),
         );
 
-        if (packet.cmd & IPMSG_FILEATTACHOPT) == IPMSG_FILEATTACHOPT && !attachments.is_empty() {
+        if packet.is_file_attach() && !attachments.is_empty() {
             ctx.engine.event_dispatcher.on_file_attachments_received(
                 ctx.peer_ip(),
                 packet.packet_no,
@@ -138,7 +140,7 @@ impl PacketHandler for SendMsgHandler {
             auto_download_clipboards(ctx, packet.packet_no, &attachments);
         }
 
-        if (packet.cmd & IPMSG_SENDCHECKOPT) == IPMSG_SENDCHECKOPT {
+        if packet.is_send_check() {
             let ack_extra = format!("{}", packet.packet_no);
             let _ = ctx
                 .engine
@@ -187,7 +189,7 @@ impl PacketHandler for KnockHandler {
 #[async_trait]
 impl PacketHandler for InputHandler {
     async fn handle(&self, ctx: &PacketContext, packet: &IPMsgPacket) -> Result<(), AppError> {
-        let cmd_base = packet.cmd & 0xFF;
+        let cmd_base = packet.command_base();
         let typing = cmd_base == IPMSG_INPUTING;
         ctx.engine
             .event_dispatcher
@@ -236,7 +238,7 @@ impl PacketDispatcher {
         packet.username = super::validation::sanitize_username(&packet.username);
         packet.hostname = super::validation::sanitize_username(&packet.hostname);
 
-        let cmd_base = packet.cmd & 0xFF;
+        let cmd_base = packet.command_base();
 
         let is_duplicate = {
             let mut cache = self.received_packets_cache.lock().unwrap();
@@ -262,7 +264,7 @@ impl PacketDispatcher {
         };
 
         if is_duplicate {
-            if cmd_base == IPMSG_SENDMSG && (packet.cmd & IPMSG_SENDCHECKOPT) == IPMSG_SENDCHECKOPT
+            if cmd_base == IPMSG_SENDMSG && packet.is_send_check()
             {
                 let ack_extra = format!("{}", packet.packet_no);
                 let peer_ip = peer_ip_addr.to_string();
@@ -310,6 +312,7 @@ impl PacketDispatcher {
 mod tests {
     use super::*;
     use crate::network::NetworkEvents;
+    use crate::protocol::Utf8Transcoder;
     use std::sync::Mutex;
 
     struct TestEvents {
@@ -347,7 +350,7 @@ mod tests {
             &self,
             _sender_ip: String,
             _packet_no: u32,
-            _files: Vec<crate::protocol::FileAttachment>,
+            _files: Vec<FileAttachment>,
         ) {
         }
         fn on_window_knock(&self, _sender_ip: String, _username: String) {}
@@ -380,12 +383,14 @@ mod tests {
         let transport = Arc::new(crate::network::FakeTransport::new(
             "127.0.0.1:0".parse().unwrap(),
         ));
+        let transcoder = Arc::new(Utf8Transcoder);
         let engine = Arc::new(
             NetworkEngine::new(
                 "alice".to_string(),
                 "alice-pc".to_string(),
                 transport,
                 events.clone(),
+                transcoder,
                 0,
             )
             .unwrap(),
@@ -426,12 +431,14 @@ mod tests {
         let transport = Arc::new(crate::network::FakeTransport::new(
             "127.0.0.1:0".parse().unwrap(),
         ));
+        let transcoder = Arc::new(Utf8Transcoder);
         let engine = Arc::new(
             NetworkEngine::new(
                 "alice".to_string(),
                 "alice-pc".to_string(),
                 transport,
                 events.clone(),
+                transcoder,
                 0,
             )
             .unwrap(),
@@ -470,12 +477,14 @@ mod tests {
         let transport = Arc::new(crate::network::FakeTransport::new(
             "127.0.0.1:0".parse().unwrap(),
         ));
+        let transcoder = Arc::new(Utf8Transcoder);
         let engine = Arc::new(
             NetworkEngine::new(
                 "alice".to_string(),
                 "alice-pc".to_string(),
                 transport,
                 events.clone(),
+                transcoder,
                 0,
             )
             .unwrap(),
